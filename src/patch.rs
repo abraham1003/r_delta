@@ -1,8 +1,20 @@
 use std::fs::File;
 use std::io::{self, Read, Write, BufReader, BufWriter, Seek, SeekFrom};
 use std::path::Path;
-use crate::delta::PatchInstruction;
+use crate::delta::{PatchInstruction, read_patch_file};
 use crate::signature::CHUNK_SIZE;
+
+macro_rules! impl_patch_applier_accessors {
+    () => {
+        fn output_writer_mut(&mut self) -> &mut dyn Write {
+            &mut self.output_writer
+        }
+
+        fn stats_mut(&mut self) -> &mut PatchStats {
+            &mut self.stats
+        }
+    };
+}
 
 trait PatchApplier {
     fn process_copy(&mut self, chunk_index: u64, length: usize) -> io::Result<()>;
@@ -61,6 +73,13 @@ impl PatchStats {
             bytes_copied: 0,
             bytes_literal: 0,
         }
+    }
+
+    #[inline]
+    fn record_copy(&mut self, bytes: usize) {
+        self.copy_instructions += 1;
+        self.bytes_copied += bytes;
+        self.bytes_written += bytes;
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -156,20 +175,12 @@ impl PatchApplier for PatchBuilder {
         }
 
         self.output_writer.write_all(&self.old_file_data[start..end])?;
-        self.stats.copy_instructions += 1;
-        self.stats.bytes_copied += length;
-        self.stats.bytes_written += length;
+        self.stats.record_copy(length);
 
         Ok(())
     }
 
-    fn output_writer_mut(&mut self) -> &mut dyn Write {
-        &mut self.output_writer
-    }
-
-    fn stats_mut(&mut self) -> &mut PatchStats {
-        &mut self.stats
-    }
+    impl_patch_applier_accessors!();
 }
 
 pub fn apply_patch<P: AsRef<Path>>(
@@ -183,45 +194,6 @@ pub fn apply_patch<P: AsRef<Path>>(
     builder.finalize()
 }
 
-fn read_patch_file<P: AsRef<Path>>(path: P) -> io::Result<Vec<PatchInstruction>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-
-    let mut count_buf = [0u8; 8];
-    reader.read_exact(&mut count_buf)?;
-    let count_u64 = u64::from_le_bytes(count_buf);
-
-    let instruction_count = usize::try_from(count_u64).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Instruction count {count_u64} exceeds platform maximum"),
-        )
-    })?;
-
-    let mut instructions = Vec::with_capacity(instruction_count);
-
-    for idx in 0..instruction_count {
-        let mut tag_buf = [0u8; 1];
-        reader.read_exact(&mut tag_buf).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("Failed to read instruction {idx} tag: {e}"),
-            )
-        })?;
-        let tag = tag_buf[0];
-
-        let instruction = PatchInstruction::from_bytes(tag, &mut reader).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Failed to parse instruction {idx}: {e}"),
-            )
-        })?;
-
-        instructions.push(instruction);
-    }
-
-    Ok(instructions)
-}
 
 pub struct StreamingPatchBuilder<R: Read + Seek, W: Write> {
     old_file_reader: BufReader<R>,
@@ -280,20 +252,12 @@ impl<R: Read + Seek, W: Write> PatchApplier for StreamingPatchBuilder<R, W> {
             remaining -= bytes_read;
         }
 
-        self.stats.copy_instructions += 1;
-        self.stats.bytes_copied += length;
-        self.stats.bytes_written += length;
+        self.stats.record_copy(length);
 
         Ok(())
     }
 
-    fn output_writer_mut(&mut self) -> &mut dyn Write {
-        &mut self.output_writer
-    }
-
-    fn stats_mut(&mut self) -> &mut PatchStats {
-        &mut self.stats
-    }
+    impl_patch_applier_accessors!();
 }
 
 pub fn apply_patch_streaming<P: AsRef<Path>>(
@@ -314,56 +278,57 @@ pub fn apply_patch_streaming<P: AsRef<Path>>(
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
     use tempfile::NamedTempFile;
+
+    fn create_temp_file_with_content(content: &[u8]) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(content).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    fn read_file_content(path: PathBuf) -> Vec<u8> {
+        let mut result = Vec::new();
+        let mut file = File::open(path).unwrap();
+        file.read_to_end(&mut result).unwrap();
+        result
+    }
+
+    fn setup_patch_builder(old_content: &[u8]) -> (NamedTempFile, NamedTempFile, PatchBuilder) {
+        let old_file = create_temp_file_with_content(old_content);
+        let output_file = NamedTempFile::new().unwrap();
+        let builder = PatchBuilder::new(old_file.path(), output_file.path()).unwrap();
+        (old_file, output_file, builder)
+    }
 
     #[test]
     fn test_patch_builder_copy() {
-        let mut old_file = NamedTempFile::new().unwrap();
-        old_file.write_all(b"Hello, World!").unwrap();
-        old_file.flush().unwrap();
-        let output_file = NamedTempFile::new().unwrap();
-        let output_path = output_file.path().to_owned();
-        let mut builder = PatchBuilder::new(old_file.path(), &output_path).unwrap();
-        let instruction = PatchInstruction::Copy(0, 5);
-        builder.apply_instruction(&instruction).unwrap();
+        let (_old_file, output_file, mut builder) = setup_patch_builder(b"Hello, World!");
+
+        builder.apply_instruction(&PatchInstruction::Copy(0, 5)).unwrap();
         let stats = builder.finalize().unwrap();
+
         assert_eq!(stats.copy_instructions, 1);
         assert_eq!(stats.bytes_copied, 5);
-        let mut result = Vec::new();
-        let mut file = File::open(output_path).unwrap();
-        file.read_to_end(&mut result).unwrap();
-        assert_eq!(&result, b"Hello");
+        assert_eq!(&read_file_content(output_file.path().to_owned()), b"Hello");
     }
 
     #[test]
     fn test_patch_builder_literal() {
-        let mut old_file = NamedTempFile::new().unwrap();
-        old_file.write_all(b"dummy").unwrap();
-        old_file.flush().unwrap();
-        let output_file = NamedTempFile::new().unwrap();
-        let output_path = output_file.path().to_owned();
-        let mut builder = PatchBuilder::new(old_file.path(), &output_path).unwrap();
-        let instruction = PatchInstruction::Literal(b"New data!".to_vec());
-        builder.apply_instruction(&instruction).unwrap();
+        let (_old_file, output_file, mut builder) = setup_patch_builder(b"dummy");
+
+        builder.apply_instruction(&PatchInstruction::Literal(b"New data!".to_vec())).unwrap();
         let stats = builder.finalize().unwrap();
+
         assert_eq!(stats.literal_instructions, 1);
         assert_eq!(stats.bytes_literal, 9);
-        let mut result = Vec::new();
-        let mut file = File::open(output_path).unwrap();
-        file.read_to_end(&mut result).unwrap();
-        assert_eq!(&result, b"New data!");
+        assert_eq!(&read_file_content(output_file.path().to_owned()), b"New data!");
     }
 
     #[test]
     fn test_patch_builder_mixed() {
-        let mut old_file = NamedTempFile::new().unwrap();
-        old_file.write_all(b"ABCDEFGHIJKLMNOP").unwrap();
-        old_file.flush().unwrap();
-
-        let output_file = NamedTempFile::new().unwrap();
-        let output_path = output_file.path().to_owned();
-
-        let mut builder = PatchBuilder::new(old_file.path(), &output_path).unwrap();
+        let (_old_file, output_file, mut builder) = setup_patch_builder(b"ABCDEFGHIJKLMNOP");
 
         builder.apply_instruction(&PatchInstruction::Copy(0, 4)).unwrap();
         builder.apply_instruction(&PatchInstruction::Literal(b"123".to_vec())).unwrap();
@@ -375,11 +340,7 @@ mod tests {
         assert_eq!(stats.literal_instructions, 1);
         assert_eq!(stats.bytes_copied, 8);
         assert_eq!(stats.bytes_literal, 3);
-
-        let mut result = Vec::new();
-        let mut file = File::open(output_path).unwrap();
-        file.read_to_end(&mut result).unwrap();
-        assert_eq!(&result, b"ABCD123ABCD");
+        assert_eq!(&read_file_content(output_file.path().to_owned()), b"ABCD123ABCD");
     }
 }
 
