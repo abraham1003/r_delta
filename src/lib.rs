@@ -1,2 +1,3 @@
 pub mod signature;
-mod delta;
+pub mod delta;
+pub mod patch;
