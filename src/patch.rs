@@ -2,7 +2,6 @@ use std::fs::File;
 use std::io::{self, Read, Write, BufReader, BufWriter, Seek, SeekFrom};
 use std::path::Path;
 use crate::delta::{PatchInstruction, read_patch_file};
-use crate::signature::CHUNK_SIZE;
 
 macro_rules! impl_patch_applier_accessors {
     () => {
@@ -149,17 +148,17 @@ impl PatchBuilder {
 }
 
 impl PatchApplier for PatchBuilder {
-    #[allow(clippy::cast_possible_truncation)]
-    fn process_copy(&mut self, chunk_index: u64, length: usize) -> io::Result<()> {
-        let start = (chunk_index as usize) * CHUNK_SIZE;
+    fn process_copy(&mut self, offset: u64, length: usize) -> io::Result<()> {
+        let start = offset as usize;
         let end = start + length;
 
         if start >= self.old_file_data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Copy instruction chunk index {chunk_index} is out of bounds (old file has {} chunks)",
-                    self.old_file_data.len().div_ceil(CHUNK_SIZE)
+                    "Copy instruction offset {} is out of bounds (old file size: {})",
+                    offset,
+                    self.old_file_data.len()
                 ),
             ));
         }
@@ -168,8 +167,8 @@ impl PatchApplier for PatchBuilder {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "Copy instruction range {start}..{end} exceeds old file size {}",
-                    self.old_file_data.len()
+                    "Copy instruction range {}..{} exceeds old file size {}",
+                    start, end, self.old_file_data.len()
                 ),
             ));
         }
@@ -229,11 +228,8 @@ impl<R: Read + Seek, W: Write> StreamingPatchBuilder<R, W> {
 }
 
 impl<R: Read + Seek, W: Write> PatchApplier for StreamingPatchBuilder<R, W> {
-    #[allow(clippy::cast_possible_truncation)]
-    fn process_copy(&mut self, chunk_index: u64, length: usize) -> io::Result<()> {
-        let start = (chunk_index as usize) * CHUNK_SIZE;
-
-        self.old_file_reader.seek(SeekFrom::Start(start as u64))?;
+    fn process_copy(&mut self, offset: u64, length: usize) -> io::Result<()> {
+        self.old_file_reader.seek(SeekFrom::Start(offset))?;
         let mut remaining = length;
         let mut buffer = vec![0u8; 8192];
 
@@ -244,7 +240,7 @@ impl<R: Read + Seek, W: Write> PatchApplier for StreamingPatchBuilder<R, W> {
             if bytes_read == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    format!("Unexpected EOF while copying {length} bytes from offset {start}"),
+                    format!("Unexpected EOF while copying {} bytes from offset {}", length, offset),
                 ));
             }
 

@@ -127,7 +127,11 @@ fn handle_signature(input_file: PathBuf, output_sig: PathBuf) -> Result<(), Stri
     println!("  Source file: {}", format_bytes(input_size));
     println!("  Signature size: {}", format_bytes(sig_size));
     println!("  Chunks: {}", signatures.len());
-    println!("  Chunk size: {} bytes", r_delta::signature::CHUNK_SIZE);
+    
+    if !signatures.is_empty() {
+        let avg_chunk = input_size / signatures.len();
+        println!("  Avg chunk size: {} bytes", avg_chunk);
+    }
 
     Ok(())
 }
