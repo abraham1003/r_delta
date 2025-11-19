@@ -6,7 +6,7 @@ use std::time::Instant;
 #[derive(Parser)]
 #[command(name = "r_delta")]
 #[command(author = "Abraham Thomas")]
-#[command(version = "0.1.0")]
+#[command(version = "0.1.2")]
 #[command(about = "Delta synchronization tool", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -46,6 +46,15 @@ enum Commands {
 
         #[arg(value_name = "OUTPUT_FILE", help = "Output reconstructed file path")]
         output_file: PathBuf,
+    },
+
+    #[command(about = "Verify two files are identical")]
+    Verify {
+        #[arg(value_name = "FILE_A", help = "First file to compare")]
+        file_a: PathBuf,
+
+        #[arg(value_name = "FILE_B", help = "Second file to compare")]
+        file_b: PathBuf,
     },
 }
 
@@ -218,6 +227,48 @@ fn handle_patch(
     Ok(())
 }
 
+fn handle_verify(file_a: PathBuf, file_b: PathBuf) -> Result<(), String> {
+    validate_file_exists(&file_a, "First file")?;
+    validate_file_exists(&file_b, "Second file")?;
+
+    println!("Verifying files...");
+    println!("  File A: '{}'", file_a.display());
+    println!("  File B: '{}'", file_b.display());
+
+    let start = Instant::now();
+
+    let result = r_delta::verify::verify_files(&file_a, &file_b)
+        .map_err(|e| format!("Verification failed: {}", e))?;
+
+    let duration = start.elapsed();
+
+    if result.are_equal {
+        println!("\n✓ Files are identical!");
+        println!("  Size: {}", format_bytes(result.file_a_size as usize));
+        println!("  Verification time: {}", format_duration(duration));
+
+        let throughput = if duration.as_secs_f64() > 0.0 {
+            result.file_a_size as f64 / duration.as_secs_f64()
+        } else {
+            0.0
+        };
+        println!("  Throughput: {}/s", format_bytes(throughput as usize));
+    } else {
+        println!("\n✗ Files are different!");
+        println!("  File A size: {}", format_bytes(result.file_a_size as usize));
+        println!("  File B size: {}", format_bytes(result.file_b_size as usize));
+
+        if let Some(offset) = result.first_mismatch_offset {
+            println!("  First mismatch at offset: {} (0x{:X})", offset, offset);
+        } else if result.file_a_size != result.file_b_size {
+            println!("  Size mismatch detected");
+        }
+        println!("  Verification time: {}", format_duration(duration));
+    }
+
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -238,6 +289,11 @@ fn main() {
             patch_file,
             output_file,
         } => handle_patch(old_file, patch_file, output_file),
+
+        Commands::Verify {
+            file_a,
+            file_b,
+        } => handle_verify(file_a, file_b),
     };
 
     if let Err(e) = result {

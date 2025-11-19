@@ -19,6 +19,7 @@ trait PatchApplier {
     fn process_copy(&mut self, chunk_index: u64, length: usize) -> io::Result<()>;
     fn output_writer_mut(&mut self) -> &mut dyn Write;
     fn stats_mut(&mut self) -> &mut PatchStats;
+
     fn process_literal(&mut self, data: &[u8]) -> io::Result<()> {
         self.output_writer_mut().write_all(data)?;
 
@@ -26,6 +27,27 @@ trait PatchApplier {
         stats.literal_instructions += 1;
         stats.bytes_literal += data.len();
         stats.bytes_written += data.len();
+
+        Ok(())
+    }
+
+    fn process_compressed_literal(&mut self, decompressed_len: u64, compressed_data: &[u8]) -> io::Result<()> {
+        let decompressed_data = zstd::decode_all(compressed_data)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Decompression failed: {}", e)))?;
+
+        if decompressed_data.len() != decompressed_len as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Decompressed size mismatch: expected {}, got {}", decompressed_len, decompressed_data.len())
+            ));
+        }
+
+        self.output_writer_mut().write_all(&decompressed_data)?;
+
+        let stats = self.stats_mut();
+        stats.literal_instructions += 1;
+        stats.bytes_literal += decompressed_data.len();
+        stats.bytes_written += decompressed_data.len();
 
         Ok(())
     }
@@ -39,6 +61,9 @@ trait PatchApplier {
             }
             PatchInstruction::Literal(data) => {
                 self.process_literal(data)
+            }
+            PatchInstruction::CompressedLiteral { decompressed_len, compressed_data } => {
+                self.process_compressed_literal(*decompressed_len, compressed_data)
             }
         }
     }

@@ -2,24 +2,26 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/built_with-Rust-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-v0.1.1--Alpha-yellow.svg)]()
+[![Status](https://img.shields.io/badge/status-v0.1.2--Alpha-yellow.svg)]()
 
-**r\_delta** is a high-performance, memory-safe binary delta compression tool. It allows you to synchronize large files between systems by transferring *only* the modified bytes, not the entire file.
+**r\_delta** is a high-performance, memory-safe data transport engine. It synchronizes large files by combining **Content-Defined Chunking (CDC)** for deduplication with **Zstd Entropy Coding** for new data compression.
 
-> **🚀 New in v0.1.1:** We have successfully migrated from Fixed-Size Chunking to **Content-Defined Chunking (FastCDC)**. This makes `r_delta` resistant to data shifts (insertions/deletions) and significantly improves deduplication rates for modified files.
+> **🚀 New in v0.1.2:** We have introduced a **Hybrid Engine**. `r_delta` now compresses non-matching literal data using **Zstd**, reducing patch sizes significantly for changed files. We also added a forensic `verify` command.
 
 ## ⚡ Why r\_delta?
 
-Most delta-transfer tools are either legacy C implementations (hard to maintain, memory unsafe) or tied to specific ecosystems. `r_delta` aims to be the modern standard:
+Most delta tools solve only half the problem (deduplication). `r_delta` solves the whole transport layer:
 
-* **Memory Safe:** Written in pure Rust.
-* **Shift Resistant:** Uses Gear Hashing and FastCDC to align chunks based on content, not arbitrary offsets.
-* **Fast:** BLAKE3 for cryptographic hashing + Gear Hash for rolling window detection.
-* **Minimal Dependencies:** Only blake3, clap, and hex (no bloat).
+* **Shift Resistant:** Uses FastCDC (Gear Hash) to align chunks based on content, not offsets.
+* **Hybrid Efficiency:**
+    * *Known Data:* Deduplicated via `COPY` instructions (O(1) HashMap lookup).
+    * *New Data:* Compressed via `COMPRESSED_LITERAL` instructions (Zstd).
+* **Memory Safe:** Streaming architecture with 8MB buffer limits prevents RAM spikes, regardless of file size.
+* **Forensic Integrity:** Includes a bit-level verification tool to guarantee `Original == Recreated`.
 
 ## The Problem CDC Solves: Shift Resistance
 
-### Legacy Fixed Chunking (rsync, older tools)
+### Legacy Fixed Chunking
 ```
 Source File:   [AAAA] [BBBB] [CCCC] [DDDD]
 
@@ -43,7 +45,7 @@ Result: ~99% deduplication. Only transmit the new byte + metadata.
 
 ## 🛠 Installation
 
-`r_delta` is not yet published to crates.io. To use it, build from source:
+`r_delta` is built from source.
 
 ```bash
 git clone https://github.com/abraham1003/r_delta
@@ -51,57 +53,64 @@ cd r_delta
 cargo build --release
 ```
 
-The binary will be located at `./target/release/r_delta`.
+The binary will be at `./target/release/r_delta`.
 
 ## 🚀 Usage
 
-`r_delta` operates in three distinct phases: **Signature**, **Delta**, and **Patch**.
+`r_delta` now operates in four phases: **Signature**, **Delta**, **Patch**, and **Verify**.
 
-### 1\. Generate a Signature
+### 1\. Signature (The Map)
 
-Create a lightweight "map" of the original file using FastCDC.
+Generate a lightweight "fingerprint" map of the old file (approx 0.7% of file size).
 
 ```bash
 ./r_delta signature <OLD_FILE> <SIG_FILE>
 ```
 
-### 2\. Calculate the Delta
+### 2\. Delta (The Hybrid Engine)
 
-Compare the new file against the signature to find changed blocks.
+Compare the new file against the signature. Matches are referenced; new data is compressed.
 
 ```bash
 ./r_delta delta <SIG_FILE> <NEW_FILE> <PATCH_FILE>
 ```
 
-### 3\. Apply the Patch
+### 3\. Patch (The Reassembler)
 
-Reconstruct the new file using the old file and the patch.
+Reconstruct the new file using the old file and the optimized patch.
 
 ```bash
 ./r_delta patch <OLD_FILE> <PATCH_FILE> <RECREATED_FILE>
 ```
 
+### 4\. Verify (The Auditor)
+
+**New in v0.1.2:** Perform a high-speed, streaming bit-for-bit comparison to prove integrity.
+
+```bash
+./r_delta verify <ORIGINAL_FILE> <RECREATED_FILE>
+```
+
 ## 🗺 Roadmap & Architecture
 
-We believe in building in public. Our CDC implementation uses industry-standard techniques found in rsync, Borg Backup, and restic.
+### Architecture Specs (v0.1.2)
 
-### FastCDC Configuration (v0.1.1)
-* **Min Chunk Size:** 2 KB (prevents metadata overhead)
-* **Avg Chunk Size:** 8 KB (industry standard)
-* **Max Chunk Size:** 64 KB (ensures deduplication efficiency)
-* **Rolling Hash:** Gear Hash (256-entry lookup table, no expensive modulo operations)
-* **Strong Hash:** BLAKE3 (SIMD-optimized, faster than SHA-256)
+* **Chunking:** FastCDC with Gear Hash (Avg 8KB chunks).
+* **Hashing:** BLAKE3 (SIMD-optimized).
+* **Compression:** Zstd (Level 3 default) for literals.
+* **Protocol:** Custom Binary Format (`0x01 COPY`, `0x02 LITERAL`, `0x03 COMPRESSED`).
+* **Safety:** 8MB Streaming Buffer for compression (Constant RAM usage).
 
 ### Feature Status
 
-| Feature | Status | Description |
-| :--- | :---: | :--- |
-| **Core Logic** | ✅ | Signature/delta/patch workflow |
-| **FastCDC Engine** | ✅ | **v0.1.1.** Gear Hash + dynamic cut-point detection |
-| **Shift Resistance** | ✅ | Handles insertions/deletions without full re-sync |
-| **Compression** | ⬜ | Zstd/Lz4 for literal data |
-| **Network Layer** | ⬜ | TCP/UDP protocol |
-| **Multi-threading** | ⬜ | Parallel chunking for large files |
+| Feature                | Status | Description                                  |
+|:-----------------------|:------:|:---------------------------------------------|
+| **FastCDC Engine**     |   ✅    | Gear Hash + dynamic cut-points               |
+| **Shift Resistance**   |   ✅    | Handles insertions/deletions                 |
+| **Hybrid Compression** |   ✅    | **v0.1.2** Zstd integration for literal runs |
+| **Network Protocol**   |   🚧   | **Next Step:** Define `protocol.rs` structs  |
+| **QUIC Transport**     |   ⬜    | Async UDP transport layer                    |
+| **Remote Sync**        |   ⬜    | Client/Server architecture                   |
 
 ## 📄 License
 

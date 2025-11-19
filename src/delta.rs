@@ -8,9 +8,12 @@ use crate::chunker::Chunker;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchInstruction {
-
     Copy(u64, usize),
     Literal(Vec<u8>),
+    CompressedLiteral {
+        decompressed_len: u64,
+        compressed_data: Vec<u8>,
+    },
 }
 
 impl PatchInstruction {
@@ -28,6 +31,14 @@ impl PatchInstruction {
                 bytes.push(0x02);
                 bytes.extend_from_slice(&(data.len() as u64).to_le_bytes());
                 bytes.extend_from_slice(data);
+                bytes
+            }
+            PatchInstruction::CompressedLiteral { decompressed_len, compressed_data } => {
+                let mut bytes = Vec::new();
+                bytes.push(0x03);
+                bytes.extend_from_slice(&decompressed_len.to_le_bytes());
+                bytes.extend_from_slice(&(compressed_data.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(compressed_data);
                 bytes
             }
         }
@@ -51,6 +62,20 @@ impl PatchInstruction {
                 let mut data = vec![0u8; length];
                 reader.read_exact(&mut data)?;
                 Ok(PatchInstruction::Literal(data))
+            }
+            0x03 => {
+                let mut decompressed_len_buf = [0u8; 8];
+                let mut compressed_len_buf = [0u8; 4];
+                reader.read_exact(&mut decompressed_len_buf)?;
+                reader.read_exact(&mut compressed_len_buf)?;
+                let decompressed_len = u64::from_le_bytes(decompressed_len_buf);
+                let compressed_len = u32::from_le_bytes(compressed_len_buf) as usize;
+                let mut compressed_data = vec![0u8; compressed_len];
+                reader.read_exact(&mut compressed_data)?;
+                Ok(PatchInstruction::CompressedLiteral {
+                    decompressed_len,
+                    compressed_data,
+                })
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -126,6 +151,9 @@ impl DeltaGenerator {
         new_file_path: P,
         patch_file_path: P,
     ) -> io::Result<DeltaStats> {
+        const MAX_LITERAL_BUFFER: usize = 8 * 1024 * 1024;
+        const COMPRESSION_THRESHOLD: usize = 64;
+
         let new_file = File::open(&new_file_path)?;
         let file_size = new_file.metadata()?.len() as usize;
 
@@ -142,14 +170,48 @@ impl DeltaGenerator {
         let mut stats = DeltaStats::new();
         let mut literal_buffer = Vec::new();
 
+        let flush_literal_buffer = |buffer: &mut Vec<u8>,
+                                      instructions: &mut Vec<PatchInstruction>,
+                                      stats: &mut DeltaStats| {
+            if buffer.is_empty() {
+                return;
+            }
+
+            let literal_len = buffer.len();
+
+            if literal_len < COMPRESSION_THRESHOLD {
+                instructions.push(PatchInstruction::Literal(buffer.clone()));
+                stats.uncompressed_literal_bytes += literal_len;
+            } else {
+                match zstd::encode_all(buffer.as_slice(), 3) {
+                    Ok(compressed_data) => {
+                        if compressed_data.len() < literal_len {
+                            instructions.push(PatchInstruction::CompressedLiteral {
+                                decompressed_len: literal_len as u64,
+                                compressed_data,
+                            });
+                            stats.compressed_instructions += 1;
+                            stats.compressed_literal_bytes += literal_len;
+                        } else {
+                            instructions.push(PatchInstruction::Literal(buffer.clone()));
+                            stats.uncompressed_literal_bytes += literal_len;
+                        }
+                    }
+                    Err(_) => {
+                        instructions.push(PatchInstruction::Literal(buffer.clone()));
+                        stats.uncompressed_literal_bytes += literal_len;
+                    }
+                }
+            }
+
+            stats.literal_bytes += literal_len;
+            stats.literal_instructions += 1;
+            buffer.clear();
+        };
+
         while let Some(chunk) = chunker.next_chunk()? {
             if let Some((offset, length)) = self.find_match(&chunk.data) {
-                if !literal_buffer.is_empty() {
-                    instructions.push(PatchInstruction::Literal(literal_buffer.clone()));
-                    stats.literal_bytes += literal_buffer.len();
-                    stats.literal_instructions += 1;
-                    literal_buffer.clear();
-                }
+                flush_literal_buffer(&mut literal_buffer, &mut instructions, &mut stats);
 
                 instructions.push(PatchInstruction::Copy(offset, length));
                 stats.copy_bytes += length;
@@ -157,15 +219,14 @@ impl DeltaGenerator {
                 stats.matches_found += 1;
             } else {
                 literal_buffer.extend_from_slice(&chunk.data);
+
+                if literal_buffer.len() >= MAX_LITERAL_BUFFER {
+                    flush_literal_buffer(&mut literal_buffer, &mut instructions, &mut stats);
+                }
             }
         }
 
-        if !literal_buffer.is_empty() {
-            let literal_len = literal_buffer.len();
-            instructions.push(PatchInstruction::Literal(literal_buffer));
-            stats.literal_bytes += literal_len;
-            stats.literal_instructions += 1;
-        }
+        flush_literal_buffer(&mut literal_buffer, &mut instructions, &mut stats);
 
         write_patch_file(&patch_file_path, &instructions)?;
 
@@ -221,6 +282,9 @@ pub struct DeltaStats {
     pub copy_bytes: usize,
     pub literal_bytes: usize,
     pub matches_found: usize,
+    pub compressed_instructions: usize,
+    pub uncompressed_literal_bytes: usize,
+    pub compressed_literal_bytes: usize,
 }
 
 impl DeltaStats {
@@ -251,6 +315,9 @@ impl DeltaStats {
         println!("  Total: {}", self.total_instructions);
         println!("  Copy instructions: {}", self.copy_instructions);
         println!("  Literal instructions: {}", self.literal_instructions);
+        if self.compressed_instructions > 0 {
+            println!("  Compressed literal instructions: {}", self.compressed_instructions);
+        }
         println!("\nData breakdown:");
         println!("  Matched (copied) bytes: {} ({:.2}%)",
                  self.copy_bytes, self.match_percentage());
@@ -259,6 +326,10 @@ impl DeltaStats {
                  if self.new_file_size == 0 { 0.0 } else {
                      (self.literal_bytes as f64 / self.new_file_size as f64) * 100.0
                  });
+        if self.compressed_literal_bytes > 0 {
+            println!("    Compressed: {} bytes", self.compressed_literal_bytes);
+            println!("    Uncompressed: {} bytes", self.uncompressed_literal_bytes);
+        }
         println!("  Matches found: {}", self.matches_found);
     }
 }
