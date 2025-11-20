@@ -1,0 +1,19 @@
+[package]
+name = "r_delta_server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "BSL-1.1"
+
+[[bin]]
+name = "r_delta_server"
+path = "src/main.rs"
+
+[dependencies]
+r_delta_core = { path = "../core" }
+tokio = { version = "1.42", features = ["full"] }
+blake3 = "1.8.2"
+quinn = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+

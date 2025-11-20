@@ -1,0 +1,24 @@
+[package]
+name = "r_delta_client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+
+[[bin]]
+name = "r_delta"
+path = "src/main.rs"
+
+[dependencies]
+r_delta_core = { path = "../core" }
+clap.workspace = true
+tokio = { version = "1.42", features = ["full"] }
+quinn = "0.11"
+blake3 = "1.8.2"
+hex = "0.4"
+zstd = "0.13"
+indicatif = "0.17"
+console = "0.15"
+env_logger = "0.11"
+log = "0.4"
+

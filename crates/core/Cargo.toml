@@ -1,0 +1,21 @@
+[package]
+name = "r_delta_core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license = "Apache-2.0"
+
+[dependencies]
+hex.workspace = true
+blake3.workspace = true
+zstd.workspace = true
+serde.workspace = true
+bincode.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+

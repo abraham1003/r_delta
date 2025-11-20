@@ -1,14 +1,25 @@
-[package]
-name = "r_delta"
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/client",
+    "crates/server",
+]
+
+[workspace.package]
 version = "0.1.2"
 edition = "2021"
+authors = ["Abraham Thomas"]
 
-[dependencies]
+[workspace.dependencies]
 hex = "0.4"
 clap = { version = "4.5.52", features = ["derive"] }
 blake3 = "1.8.2"
 zstd = "0.13"
-
-[dev-dependencies]
-tempfile = "3"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "2.0.1"
+quinn = "0.11"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.0"
 
