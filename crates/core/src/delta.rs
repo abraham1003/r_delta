@@ -14,6 +14,7 @@ pub enum PatchInstruction {
         decompressed_len: u64,
         compressed_data: Vec<u8>,
     },
+    Skip(u64),
 }
 
 impl PatchInstruction {
@@ -39,6 +40,12 @@ impl PatchInstruction {
                 bytes.extend_from_slice(&decompressed_len.to_le_bytes());
                 bytes.extend_from_slice(&(compressed_data.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(compressed_data);
+                bytes
+            }
+            PatchInstruction::Skip(length) => {
+                let mut bytes = Vec::new();
+                bytes.push(0x04);
+                bytes.extend_from_slice(&length.to_le_bytes());
                 bytes
             }
         }
@@ -77,6 +84,12 @@ impl PatchInstruction {
                     compressed_data,
                 })
             }
+            0x04 => {
+                let mut length_buf = [0u8; 8];
+                reader.read_exact(&mut length_buf)?;
+                let length = u64::from_le_bytes(length_buf);
+                Ok(PatchInstruction::Skip(length))
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Unknown patch instruction tag: {}", tag),
@@ -96,7 +109,7 @@ impl SignatureMap {
         for sig in signatures {
             weak_hash_map
                 .entry(sig.weak_hash)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(sig);
         }
 
@@ -133,7 +146,7 @@ impl DeltaGenerator {
         *blake3::hash(data).as_bytes()
     }
 
-    fn find_match(&self, data: &[u8]) -> Option<(u64, usize)> {
+    pub fn find_match(&self, data: &[u8]) -> Option<(u64, usize)> {
         let weak_hash = self.compute_weak_hash(data);
         let candidates = self.signature_map.lookup(weak_hash)?;
         let strong_hash = self.compute_strong_hash(data);
@@ -228,14 +241,57 @@ impl DeltaGenerator {
 
         flush_literal_buffer(&mut literal_buffer, &mut instructions, &mut stats);
 
-        write_patch_file(&patch_file_path, &instructions)?;
+        let optimized_instructions = optimize_instructions(instructions);
+        write_patch_file(&patch_file_path, &optimized_instructions)?;
 
-        stats.total_instructions = instructions.len();
+        stats.total_instructions = optimized_instructions.len();
         stats.new_file_size = file_size;
         stats.patch_file_size = std::fs::metadata(patch_file_path)?.len() as usize;
 
         Ok(stats)
     }
+}
+
+fn optimize_instructions(instructions: Vec<PatchInstruction>) -> Vec<PatchInstruction> {
+    const MIN_SKIP_THRESHOLD: usize = 3;
+
+    let mut optimized = Vec::new();
+    let mut i = 0;
+
+    while i < instructions.len() {
+        if let PatchInstruction::Copy(offset, length) = instructions[i] {
+            let mut consecutive_copies = vec![(offset, length)];
+            let mut j = i + 1;
+
+            while j < instructions.len() {
+                if let PatchInstruction::Copy(next_offset, next_length) = instructions[j] {
+                    let last = consecutive_copies.last().unwrap();
+                    if next_offset == last.0 + last.1 as u64 {
+                        consecutive_copies.push((next_offset, next_length));
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if consecutive_copies.len() >= MIN_SKIP_THRESHOLD {
+                let total_length: u64 = consecutive_copies.iter().map(|(_, len)| *len as u64).sum();
+                optimized.push(PatchInstruction::Skip(total_length));
+                i = j;
+            } else {
+                optimized.push(instructions[i].clone());
+                i += 1;
+            }
+        } else {
+            optimized.push(instructions[i].clone());
+            i += 1;
+        }
+    }
+
+    optimized
 }
 
 fn write_patch_file<P: AsRef<Path>>(path: P, instructions: &[PatchInstruction]) -> io::Result<()> {

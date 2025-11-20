@@ -65,8 +65,14 @@ trait PatchApplier {
             PatchInstruction::CompressedLiteral { decompressed_len, compressed_data } => {
                 self.process_compressed_literal(*decompressed_len, compressed_data)
             }
+            PatchInstruction::Skip(length) => {
+                self.process_skip(*length)
+            }
         }
     }
+
+    fn process_skip(&mut self, length: u64) -> io::Result<()>;
+
 
     fn apply_instructions(&mut self, instructions: &[PatchInstruction]) -> io::Result<()> {
         for instruction in instructions {
@@ -204,6 +210,25 @@ impl PatchApplier for PatchBuilder {
         Ok(())
     }
 
+    fn process_skip(&mut self, length: u64) -> io::Result<()> {
+        let length_usize = length as usize;
+
+        if length_usize > self.old_file_data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Skip instruction length {} exceeds old file size {}",
+                    length, self.old_file_data.len()
+                ),
+            ));
+        }
+
+        self.output_writer.write_all(&self.old_file_data[..length_usize])?;
+        self.stats.record_copy(length_usize);
+
+        Ok(())
+    }
+
     impl_patch_applier_accessors!();
 }
 
@@ -274,6 +299,31 @@ impl<R: Read + Seek, W: Write> PatchApplier for StreamingPatchBuilder<R, W> {
         }
 
         self.stats.record_copy(length);
+
+        Ok(())
+    }
+
+    fn process_skip(&mut self, length: u64) -> io::Result<()> {
+        self.old_file_reader.seek(SeekFrom::Start(0))?;
+        let mut remaining = length;
+        let mut buffer = vec![0u8; 8192];
+
+        while remaining > 0 {
+            let to_read = std::cmp::min(remaining as usize, buffer.len());
+            let bytes_read = self.old_file_reader.read(&mut buffer[..to_read])?;
+
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("Unexpected EOF while skipping {} bytes", length),
+                ));
+            }
+
+            self.output_writer.write_all(&buffer[..bytes_read])?;
+            remaining -= bytes_read as u64;
+        }
+
+        self.stats.record_copy(length as usize);
 
         Ok(())
     }

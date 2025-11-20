@@ -3,3 +3,5 @@ pub mod signature;
 pub mod delta;
 pub mod patch;
 pub mod verify;
+pub mod protocol;
+pub mod network;
