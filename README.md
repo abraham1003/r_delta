@@ -1,12 +1,18 @@
 # r\_delta
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0_%2F_BSL_1.1-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/built_with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-v0.1.2--Alpha-yellow.svg)]()
 
-**r\_delta** is a high-performance, memory-safe data transport engine. It synchronizes large files by combining **Content-Defined Chunking (CDC)** for deduplication with **Zstd Entropy Coding** for new data compression.
+**r\_delta** is a high-performance, data transport engine that achieves **99%+ bandwidth savings** on incremental updates. It combines **Content-Defined Chunking (CDC)** for shift-resistant deduplication with **Zstd compression** and **SKIP optimization** for maximum efficiency.
 
-> **🚀 New in v0.1.2:** We have introduced a **Hybrid Engine**. `r_delta` now compresses non-matching literal data using **Zstd**, reducing patch sizes significantly for changed files. We also added a forensic `verify` command.
+> **🚀 New in v0.1.2:** 
+> - ✅ **Hybrid Compression**: Zstd integration for optimal patch sizes
+> - ✅ **Network Sync**: Full QUIC-based client-server architecture with cryptographic verification
+> - ✅ **Professional UX**: Real-time progress bars, spinners, and deduplication reports
+> - ✅ **SKIP Optimization**: Additional 5% patch size reduction for large sequential regions
+> - ✅ **Telemetry**: Structured logging with performance metrics (throughput, duration, savings)
+> - ✅ **Forensic Verification**: Bit-level integrity checking
 
 ## ⚡ Why r\_delta?
 
@@ -15,9 +21,13 @@ Most delta tools solve only half the problem (deduplication). `r_delta` solves t
 * **Shift Resistant:** Uses FastCDC (Gear Hash) to align chunks based on content, not offsets.
 * **Hybrid Efficiency:**
     * *Known Data:* Deduplicated via `COPY` instructions (O(1) HashMap lookup).
-    * *New Data:* Compressed via `COMPRESSED_LITERAL` instructions (Zstd).
+    * *New Data:* Compressed via `COMPRESSED_LITERAL` instructions (Zstd level 3).
+    * *Sequential Data:* Optimized via `SKIP` instructions (~5% metadata reduction).
 * **Memory Safe:** Streaming architecture with 8MB buffer limits prevents RAM spikes, regardless of file size.
-* **Forensic Integrity:** Includes a bit-level verification tool to guarantee `Original == Recreated`.
+* **Professional UX:** Real-time progress bars, spinners, and deduplication reports show exactly what's happening.
+* **Telemetry:** Structured logging with performance metrics (throughput, duration, savings).
+* **Forensic Integrity:** Bit-level verification tool guarantees `Original == Recreated`.
+* **Network Ready:** QUIC-based transport with automatic delta detection and cryptographic verification.
 
 ## The Problem CDC Solves: Shift Resistance
 
@@ -45,7 +55,7 @@ Result: ~99% deduplication. Only transmit the new byte + metadata.
 
 ## 🛠 Installation
 
-`r_delta` is built from source.
+`r_delta` is must be built from source using Cargo workspaces.
 
 ```bash
 git clone https://github.com/abraham1003/r_delta
@@ -53,18 +63,36 @@ cd r_delta
 cargo build --release
 ```
 
-The binary will be at `./target/release/r_delta`.
+The binaries will be compiled to:
+- `./target/release/r_delta` (client CLI)
+- `./target/release/r_delta_server` (server daemon)
+
+**Note:** The CLI tool is not yet published to crates.io.
+
+### Workspace Structure
+
+The repository is structured as a workspace with three crates:
+- **`crates/core`** - The core library (Apache 2.0) 
+- **`crates/client`** - The CLI tool (Apache 2.0)
+- **`crates/server`** - The server component (BSL 1.1)
 
 ## 🚀 Usage
 
-`r_delta` now operates in four phases: **Signature**, **Delta**, **Patch**, and **Verify**.
+`r_delta` operates in five phases: **Signature**, **Delta**, **Patch**, **Verify**, and **Sync**.
+
+After building, use the compiled binaries directly from `./target/release/`:
 
 ### 1\. Signature (The Map)
 
 Generate a lightweight "fingerprint" map of the old file (approx 0.7% of file size).
 
 ```bash
-./r_delta signature <OLD_FILE> <SIG_FILE>
+./target/release/r_delta signature <OLD_FILE> <SIG_FILE>
+```
+
+**Example:**
+```bash
+./target/release/r_delta signature old_version.bin old.sig
 ```
 
 ### 2\. Delta (The Hybrid Engine)
@@ -72,7 +100,12 @@ Generate a lightweight "fingerprint" map of the old file (approx 0.7% of file si
 Compare the new file against the signature. Matches are referenced; new data is compressed.
 
 ```bash
-./r_delta delta <SIG_FILE> <NEW_FILE> <PATCH_FILE>
+./target/release/r_delta delta <SIG_FILE> <NEW_FILE> <PATCH_FILE>
+```
+
+**Example:**
+```bash
+./target/release/r_delta delta old.sig new_version.bin patch.bin
 ```
 
 ### 3\. Patch (The Reassembler)
@@ -80,38 +113,105 @@ Compare the new file against the signature. Matches are referenced; new data is 
 Reconstruct the new file using the old file and the optimized patch.
 
 ```bash
-./r_delta patch <OLD_FILE> <PATCH_FILE> <RECREATED_FILE>
+./target/release/r_delta patch <OLD_FILE> <PATCH_FILE> <RECREATED_FILE>
+```
+
+**Example:**
+```bash
+./target/release/r_delta patch old_version.bin patch.bin restored.bin
 ```
 
 ### 4\. Verify (The Auditor)
 
-**New in v0.1.2:** Perform a high-speed, streaming bit-for-bit comparison to prove integrity.
+Perform a high-speed, streaming bit-for-bit comparison to prove integrity.
 
 ```bash
-./r_delta verify <ORIGINAL_FILE> <RECREATED_FILE>
+./target/release/r_delta verify <ORIGINAL_FILE> <RECREATED_FILE>
+```
+
+**Example:**
+```bash
+./target/release/r_delta verify new_version.bin restored.bin
+```
+
+### 5\. Sync (The Network Transport)
+
+Synchronize a file to a remote server using automatic delta detection and compression.
+
+The sync command orchestrates the entire pipeline:
+1. Connects to the server
+2. Server sends its version's signature (if file exists)
+3. Client computes delta automatically
+4. Client streams optimized patch to server
+5. Server reconstructs and verifies
+
+```bash
+./target/release/r_delta sync <FILE> <SERVER:PORT>
+```
+
+**Example:**
+```bash
+# Server (runs continuously)
+./target/release/r_delta_server
+
+# Client (in another terminal)
+./target/release/r_delta sync file.bin 127.0.0.1:4433
 ```
 
 ## 🗺 Roadmap & Architecture
 
+### Workspace Structure (v0.1.2)
+
+The project is organized as a Cargo workspace with clear separation of concerns:
+
+**Design Philosophy:**
+- **Core Library (Apache 2.0)**
+- **Client CLI (Apache 2.0)**
+- **Server (BSL 1.1)**
+
 ### Architecture Specs (v0.1.2)
 
-* **Chunking:** FastCDC with Gear Hash (Avg 8KB chunks).
-* **Hashing:** BLAKE3 (SIMD-optimized).
-* **Compression:** Zstd (Level 3 default) for literals.
-* **Protocol:** Custom Binary Format (`0x01 COPY`, `0x02 LITERAL`, `0x03 COMPRESSED`).
-* **Safety:** 8MB Streaming Buffer for compression (Constant RAM usage).
+* **Chunking:** FastCDC (Content-Defined Chunking) with Gear Hash.
+* **Fingerprinting:** BLAKE3 (SIMD-optimized) for O(1) block identification.
+* **Compression:** Hybrid Mode.
+  * *Deduplication:* HashMap lookups for known data.
+  * *Compression:* Zstd (Streaming Mode) for unknown literals.
+* **Transport Protocol:** QUIC (via `quinn`).
+  * *Stream 1 (Bi-directional):* Control Plane (Handshakes, Signatures) via Bincode.
+  * *Stream 2 (Uni-directional):* Data Plane (Patch Transfer).
 
 ### Feature Status
 
-| Feature                | Status | Description                                  |
-|:-----------------------|:------:|:---------------------------------------------|
-| **FastCDC Engine**     |   ✅    | Gear Hash + dynamic cut-points               |
-| **Shift Resistance**   |   ✅    | Handles insertions/deletions                 |
-| **Hybrid Compression** |   ✅    | **v0.1.2** Zstd integration for literal runs |
-| **Network Protocol**   |   🚧   | **Next Step:** Define `protocol.rs` structs  |
-| **QUIC Transport**     |   ⬜    | Async UDP transport layer                    |
-| **Remote Sync**        |   ⬜    | Client/Server architecture                   |
+| Feature                   | Status | Description                                     |
+|:--------------------------|:------:|:------------------------------------------------|
+| **FastCDC Engine**        |   ✅    | Gear Hash + dynamic cut-points                  |
+| **Shift Resistance**      |   ✅    | Handles insertions/deletions                    |
+| **Hybrid Compression**    |   ✅    | Zstd integration for literal runs               |
+| **SKIP Optimization**     |   ✅    | **v0.1.2** Merges consecutive COPYs (~5% gain)  |
+| **Progress Bars**         |   ✅    | **v0.1.2** Real-time visual feedback            |
+| **Deduplication Report**  |   ✅    | **v0.1.2** Shows bandwidth savings              |
+| **Structured Logging**    |   ✅    | **v0.1.2** Telemetry & metrics       |
+| **QUIC Configuration**    |   ✅    | Server/Client config generators                 |
+| **Remote Sync**           |   ✅    | End-to-end network sync (`sync`)                |
+| **Multi-file Sync**       |   ⬜    | Directory/repository synchronization            |
 
-## 📄 License
+### Why r_delta is Fast
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE) for details.
+1. **Content-Defined Chunking**: O(1) hash lookups for chunk matching
+2. **BLAKE3 Hashing**: SIMD-optimized cryptographic hashing (4-8x faster than SHA-256)
+3. **Zstd Compression**: Industry-leading decompression speed (~10x faster than gzip)
+4. **SKIP Optimization**: Reduces metadata overhead by ~5% for sequential regions
+5. **Streaming Architecture**: Constant memory usage regardless of file size
+6. **QUIC Protocol**: Multiplexed streams with 0-RTT connection establishment
+
+## 📄 Licensing
+
+This repository uses a split licensing model to balance open ecosystem growth with sustainable development:
+
+| Component        | Path            | License        | Usage                                                                                                   |
+|:-----------------|:----------------|:---------------|:--------------------------------------------------------------------------------------------------------|
+| **Core Library** | `crates/core`   | **Apache 2.0** | Free for any use.                                                                                       |
+| **Client CLI**   | `crates/client` | **Apache 2.0** | Free for any use.                                                                                       |
+| **Server**       | `crates/server` | **BSL 1.1**    | Free for non-production/personal use. Commercial use requires a license or waiting for the Change Date. |
+
+See [LICENSE](./LICENSE) for the Apache 2.0 terms and [Server License](./crates/server/LICENSE) for the BSL 1.1 terms.
