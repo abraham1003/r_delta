@@ -2,11 +2,14 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0_%2F_BSL_1.1-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/built_with-Rust-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-v0.1.2--Alpha-yellow.svg)]()
+[![Status](https://img.shields.io/badge/status-v0.1.3--Alpha-yellow.svg)]()
 
 **r\_delta** is a high-performance, data transport engine that achieves **99%+ bandwidth savings** on incremental updates. It combines **Content-Defined Chunking (CDC)** for shift-resistant deduplication with **Zstd compression** and **SKIP optimization** for maximum efficiency.
 
-> **🚀 New in v0.1.2** 
+> **🚀 New in v0.1.3**
+> - ✅ **Parallel Directory Sync**: Concurrent file transfers (up to 50 files simultaneously) via futures::stream
+>
+> **v0.1.2 Features** 
 > - ✅ **Directory Synchronization**: Sync entire directories with smart diff algorithm
 > - ✅ **Manifest Generation**: Fast directory walking with `.gitignore` support (ignore crate)
 > - ✅ **Hybrid Compression**: Zstd integration for optimal patch sizes
@@ -157,9 +160,9 @@ The sync command orchestrates the entire pipeline:
 ./target/release/r_delta sync <FILE> <SERVER:PORT>
 ```
 
-#### Directory Sync
+#### Directory Sync (The Swarm)
 
-Synchronize entire directory trees with intelligent manifest-based coordination:
+Synchronize entire directory trees with intelligent manifest-based coordination and parallel execution:
 
 1. Client builds lightweight manifest (path, size, modified time, BLAKE3 checksum)
 2. Client connects to server and sends manifest via QUIC
@@ -168,7 +171,9 @@ Synchronize entire directory trees with intelligent manifest-based coordination:
    - **SendDelta**: Modified files (compute and stream delta patch)
    - **Skip**: Identical files (verified by size + content hash)
    - **Delete**: Files on server but not in client (removed after sync completes)
-4. Client executes plan:
+4. Client executes plan with parallelism:
+   - Up to 50 concurrent file transfers simultaneously
+   - Saturates bandwidth and hides network latency
    - New files uploaded in full
    - Modified files use delta for 50-99% bandwidth savings
    - Identical files skipped entirely
@@ -189,7 +194,7 @@ Synchronize entire directory trees with intelligent manifest-based coordination:
 
 ## 🗺 Roadmap & Architecture
 
-### Workspace Structure (v0.1.2)
+### Workspace Structure (v0.1.3)
 
 The project is organized as a Cargo workspace with clear separation of concerns:
 
@@ -198,7 +203,7 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 - **Client CLI (Apache 2.0)**
 - **Server (BSL 1.1)**
 
-### Architecture Specs (v0.1.2)
+### Architecture Specs (v0.1.3)
 
 * **Chunking:** FastCDC (Content-Defined Chunking) with Gear Hash.
 * **Fingerprinting:** BLAKE3 (SIMD-optimized) for O(1) block identification.
@@ -208,6 +213,7 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 * **Transport Protocol:** QUIC (via `quinn`).
   * *Stream 1 (Bi-directional):* Control Plane (Handshakes, Signatures) via Bincode.
   * *Stream 2 (Uni-directional):* Data Plane (Patch Transfer).
+* **Concurrency:** Async streams with `buffer_unordered(50)` for parallel directory sync.
 
 ### Feature Status
 
@@ -224,7 +230,7 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 | **Diff Algorithm**      |   ✅    | O(n log n) manifest comparison & sync actions  |
 | **Content Hashing**     |   ✅    | BLAKE3 checksums for reliable change detection |
 | **Sync Planning**       |   ✅    | Protocol for manifest exchange & coordination  |
-| **Parallel Transfer**   |  🏗️   | Thread pool for concurrent sync    |
+| **Parallel Transfer**   |   ✅    | futures::stream with 50-concurrent buffer |
 
 ### Why r_delta is Fast
 
@@ -237,6 +243,7 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 7. **Fast Directory Walking**: The `ignore` crate (ripgrep engine) with `.gitignore` awareness for quick manifests
 8. **Smart Diff Algorithm**: O(n log n) manifest comparison to identify only changed files
 9. **Selective File Transfer**: Skips unchanged files entirely, only syncs SendFull/SendDelta actions
+10. **Parallel Transfers**: Up to 50 concurrent files saturate bandwidth and hide latency costs
 
 ## 📄 Licensing
 

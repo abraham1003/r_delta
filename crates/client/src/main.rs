@@ -7,6 +7,7 @@ use std::io::{Read, BufReader};
 use indicatif::{ProgressBar, ProgressStyle};
 use console::style;
 use anyhow::Result;
+use futures::stream::{self, StreamExt};
 
 async fn handle_sync_dir(directory: PathBuf, server: String) -> Result<(), String> {
     if !directory.exists() {
@@ -101,31 +102,65 @@ async fn handle_sync_dir(directory: PathBuf, server: String) -> Result<(), Strin
         return Ok(());
     }
 
+    let files_to_sync_count = files_to_sync.len();
     if !files_to_sync.is_empty() {
-        println!("\n→ Syncing {} files...", files_to_sync.len());
-    }
-    
-    for (idx, file_path) in files_to_sync.iter().enumerate() {
-        let action = sync_plan.items.iter()
-            .find(|item| &item.path == file_path)
-            .map(|item| &item.action);
-
-        let full_path = directory.join(file_path);
+        println!("\n→ Syncing {} files...", files_to_sync_count);
         
-        println!("\n[{}/{}] {}", 
-            idx + 1, 
-            files_to_sync.len(), 
-            file_path);
-
-        match action {
-            Some(r_delta_core::diff::SyncAction::SendFull) => {
-                sync_single_file(&full_path, file_path, &connection, false).await?;
+        let pb = ProgressBar::new(files_to_sync_count as u64);
+        pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("#>-"));
+            
+        let connection = connection.clone();
+        let directory = directory.clone();
+        let sync_plan_items = sync_plan.items.clone();
+        
+        let results: Vec<Result<(), String>> = stream::iter(files_to_sync)
+            .map(|file_path| {
+                let connection = connection.clone();
+                let directory = directory.clone();
+                let pb = pb.clone();
+                let action = sync_plan_items.iter()
+                    .find(|item| &item.path == &file_path)
+                    .map(|item| item.action.clone());
+                let file_path = file_path.clone();
+                    
+                async move {
+                    let full_path = directory.join(&file_path);
+                    pb.set_message(format!("Syncing {}", file_path));
+                    
+                    let result = match action {
+                        Some(r_delta_core::diff::SyncAction::SendFull) => {
+                            sync_single_file(&full_path, &file_path, &connection, false, true).await
+                        }
+                        Some(r_delta_core::diff::SyncAction::SendDelta) => {
+                            sync_single_file(&full_path, &file_path, &connection, true, true).await
+                        }
+                        _ => Ok(()),
+                    };
+                    
+                    pb.inc(1);
+                    result
+                }
+            })
+            .buffer_unordered(50)
+            .collect()
+            .await;
+            
+        pb.finish_with_message("Sync complete");
+        
+        let errors: Vec<String> = results.into_iter()
+            .filter_map(|r| r.err())
+            .collect();
+            
+        if !errors.is_empty() {
+            println!("\n⚠️ Encountered {} errors during sync:", errors.len());
+            for err in errors.iter().take(5) {
+                println!("  - {}", err);
             }
-            Some(r_delta_core::diff::SyncAction::SendDelta) => {
-                sync_single_file(&full_path, file_path, &connection, true).await?;
-            }
-            _ => {
-                println!("  ⊘ Skipped");
+            if errors.len() > 5 {
+                println!("  ... and {} more", errors.len() - 5);
             }
         }
     }
@@ -140,7 +175,7 @@ async fn handle_sync_dir(directory: PathBuf, server: String) -> Result<(), Strin
     let duration = start.elapsed();
     println!("\n✓ Directory synchronization complete!");
     println!("  Total time: {}", format_duration(duration));
-    println!("  Files processed: {}", files_to_sync.len());
+    println!("  Files processed: {}", files_to_sync_count);
 
     connection.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
@@ -153,6 +188,7 @@ async fn sync_single_file(
     relative_path: &str,
     connection: &quinn::Connection,
     use_delta: bool,
+    silent: bool,
 ) -> Result<(), String> {
     let metadata = std::fs::metadata(file_path)
         .map_err(|e| format!("Failed to read file metadata: {}", e))?;
@@ -172,7 +208,7 @@ async fn sync_single_file(
     match ack {
         r_delta_core::protocol::NetMessage::HandshakeAck { has_old_file } => {
             if has_old_file && use_delta {
-                println!("  → Delta sync");
+                if !silent { println!("  → Delta sync"); }
                 handle_differential_sync(
                     file_path,
                     connection,
@@ -180,7 +216,7 @@ async fn sync_single_file(
                     &mut recv_stream,
                 ).await?;
             } else {
-                println!("  → Full upload");
+                if !silent { println!("  → Full upload"); }
                 handle_full_upload(file_path, connection).await?;
             }
         }
@@ -196,7 +232,7 @@ async fn sync_single_file(
     match verify_msg {
         r_delta_core::protocol::NetMessage::VerifyResult { matches, .. } => {
             if matches {
-                println!("  ✓ Verified");
+                if !silent { println!("  ✓ Verified"); }
             } else {
                 return Err("Server verification failed".to_string());
             }
