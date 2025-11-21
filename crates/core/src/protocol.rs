@@ -39,6 +39,10 @@ pub enum NetMessage {
     SyncPlan {
         items: Vec<SyncItem>,
     },
+    SendFullCompressed {
+        filename: String,
+        original_size: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode)]

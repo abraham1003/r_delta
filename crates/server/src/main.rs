@@ -78,6 +78,19 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<(), Box<dyn std:
                 remote_addr,
             ).await?;
         }
+        NetMessage::SendFullCompressed { filename, original_size } => {
+            info!("Compressed file upload from {}: file='{}', original_size={} bytes",
+                  remote_addr, filename, original_size);
+
+            handle_compressed_file_sync(
+                filename,
+                original_size,
+                &connection,
+                &mut send_stream,
+                &mut recv_stream,
+                remote_addr,
+            ).await?;
+        }
         NetMessage::ManifestRequest => {
             info!("Directory sync from {}", remote_addr);
             handle_directory_sync(
@@ -90,7 +103,7 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<(), Box<dyn std:
         _ => {
             error!("Invalid initial message from {}", remote_addr);
             send_message(&mut send_stream, &NetMessage::error(
-                "Expected Handshake or ManifestRequest message".to_string()
+                "Expected Handshake, SendFullCompressed, or ManifestRequest message".to_string()
             )).await?;
             return Err("Invalid initial message".into());
         }
@@ -174,7 +187,6 @@ async fn handle_directory_sync(
         info!("No files to sync from {}", remote_addr);
         info!("Directory sync from {} completed successfully", remote_addr);
         
-        // Give time for client to receive and process the sync plan message
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         
         return Ok(());
@@ -189,90 +201,153 @@ async fn handle_directory_sync(
 
         let handshake_msg = receive_message(&mut file_recv).await?;
 
-        let (filename, _file_size) = match handshake_msg {
-            NetMessage::Handshake { filename, file_size, protocol_version } => {
+        match handshake_msg {
+            NetMessage::Handshake { filename, file_size: _, protocol_version } => {
                 if protocol_version != 1 {
                     send_message(&mut file_send, &NetMessage::error(
                         format!("Unsupported protocol version: {}", protocol_version)
                     )).await?;
                     continue;
                 }
-                (filename, file_size)
-            }
-            _ => {
-                error!("Expected Handshake for file {}", file_path);
-                continue;
-            }
-        };
 
-        let file_full_path = storage_dir.join(&filename);
-        
-        if let Some(parent) = file_full_path.parent() {
-            create_dir_all(parent)?;
-        }
+                let file_full_path = storage_dir.join(&filename);
+                
+                if let Some(parent) = file_full_path.parent() {
+                    create_dir_all(parent)?;
+                }
 
-        let has_old_file = file_full_path.exists();
-        send_message(&mut file_send, &NetMessage::handshake_ack(has_old_file)).await?;
+                let has_old_file = file_full_path.exists();
+                send_message(&mut file_send, &NetMessage::handshake_ack(has_old_file)).await?;
 
-        if has_old_file {
-            let signatures = generate_signatures(&file_full_path)?;
-            send_message(&mut file_send, &NetMessage::RequestSignature).await?;
+                if has_old_file {
+                    let signatures = generate_signatures(&file_full_path)?;
+                    send_message(&mut file_send, &NetMessage::RequestSignature).await?;
 
-            const SIGNATURE_BATCH_SIZE: usize = 100;
-            for chunk in signatures.chunks(SIGNATURE_BATCH_SIZE) {
-                let packet = NetMessage::signature_packet(chunk.to_vec());
-                send_message(&mut file_send, &packet).await?;
-            }
-            send_message(&mut file_send, &NetMessage::SignatureEnd).await?;
-
-            let mut data_stream = connection.accept_uni().await?;
-            let start_msg = receive_message(&mut data_stream).await?;
-            
-            if !matches!(start_msg, NetMessage::StartPatch) {
-                error!("Expected StartPatch for {}", filename);
-                continue;
-            }
-
-            let temp_path = storage_dir.join(format!("{}.tmp", filename));
-            apply_patch_from_stream(&file_full_path, &mut data_stream, &temp_path).await?;
-            rename(&temp_path, &file_full_path)?;
-
-            let checksum = compute_file_checksum(&file_full_path)?;
-            send_message(&mut file_send, &NetMessage::verify_result(true, checksum)).await?;
-            file_send.finish()?;
-        } else {
-            let mut data_stream = connection.accept_uni().await?;
-            let temp_path = storage_dir.join(format!("{}.tmp", filename));
-            
-            if let Some(parent) = temp_path.parent() {
-                create_dir_all(parent)?;
-            }
-
-            let mut file = BufWriter::new(File::create(&temp_path)?);
-            let mut buffer = vec![0u8; BUFFER_SIZE];
-
-            loop {
-                match data_stream.read(&mut buffer).await {
-                    Ok(Some(n)) => {
-                        file.write_all(&buffer[..n])?;
+                    const SIGNATURE_BATCH_SIZE: usize = 100;
+                    for chunk in signatures.chunks(SIGNATURE_BATCH_SIZE) {
+                        let packet = NetMessage::signature_packet(chunk.to_vec());
+                        send_message(&mut file_send, &packet).await?;
                     }
-                    Ok(None) => break,
-                    Err(e) => {
-                        error!("Read error: {}", e);
-                        return Err(e.into());
+                    send_message(&mut file_send, &NetMessage::SignatureEnd).await?;
+
+                    let mut data_stream = connection.accept_uni().await?;
+                    let start_msg = receive_message(&mut data_stream).await?;
+                    
+                    if !matches!(start_msg, NetMessage::StartPatch) {
+                        error!("Expected StartPatch for {}", filename);
+                        continue;
+                    }
+
+                    let temp_path = storage_dir.join(format!("{}.tmp", filename));
+                    apply_patch_from_stream(&file_full_path, &mut data_stream, &temp_path).await?;
+                    rename(&temp_path, &file_full_path)?;
+
+                    let checksum = compute_file_checksum(&file_full_path)?;
+                    send_message(&mut file_send, &NetMessage::verify_result(true, checksum)).await?;
+                    file_send.finish()?;
+                } else {
+                    let mut data_stream = connection.accept_uni().await?;
+                    let temp_path = storage_dir.join(format!("{}.tmp", filename));
+                    
+                    if let Some(parent) = temp_path.parent() {
+                        create_dir_all(parent)?;
+                    }
+
+                    let mut file = BufWriter::new(File::create(&temp_path)?);
+                    let mut buffer = vec![0u8; BUFFER_SIZE];
+
+                    loop {
+                        match data_stream.read(&mut buffer).await {
+                            Ok(Some(n)) => {
+                                file.write_all(&buffer[..n])?;
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                error!("Read error: {}", e);
+                                return Err(e.into());
+                            }
+                        }
+                    }
+
+                    drop(file);
+                    rename(&temp_path, &file_full_path)?;
+
+                    let checksum = compute_file_checksum(&file_full_path)?;
+                    send_message(&mut file_send, &NetMessage::verify_result(true, checksum)).await?;
+                    file_send.finish()?;
+                }
+
+                info!("  ✓ {} synced successfully", filename);
+            }
+            NetMessage::SendFullCompressed { filename, original_size } => {
+                info!("  → Receiving compressed file: {} ({} bytes)", filename, original_size);
+
+                let file_full_path = storage_dir.join(&filename);
+                
+                if let Some(parent) = file_full_path.parent() {
+                    create_dir_all(parent)?;
+                }
+
+                let mut data_stream = connection.accept_uni().await?;
+                let mut compressed_data = Vec::new();
+                let mut buffer = vec![0u8; BUFFER_SIZE];
+
+                loop {
+                    match data_stream.read(&mut buffer).await {
+                        Ok(Some(n)) => {
+                            compressed_data.extend_from_slice(&buffer[..n]);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            error!("Stream read error: {}", e);
+                            return Err(e.into());
+                        }
                     }
                 }
+
+                let decompressed_data = zstd::decode_all(compressed_data.as_slice())
+                    .map_err(|e| {
+                        error!("Decompression failed for {}: {}", filename, e);
+                        format!("Decompression failed: {}", e)
+                    })?;
+
+                if decompressed_data.len() as u64 != original_size {
+                    error!("Size mismatch for {}: expected {}, got {}",
+                           filename, original_size, decompressed_data.len());
+                    return Err(format!(
+                        "Size mismatch: expected {}, got {}",
+                        original_size, decompressed_data.len()
+                    ).into());
+                }
+
+                let temp_path = storage_dir.join(format!("{}.tmp", filename));
+                
+                if let Some(parent) = temp_path.parent() {
+                    create_dir_all(parent)?;
+                }
+
+                let mut file = File::create(&temp_path)?;
+                file.write_all(&decompressed_data)?;
+                file.flush()?;
+                drop(file);
+
+                rename(&temp_path, &file_full_path)?;
+
+                let compression_ratio = (compressed_data.len() as f64 / original_size as f64) * 100.0;
+                info!("  → Compressed: {} bytes → {} bytes ({:.1}% ratio)",
+                      compressed_data.len(), original_size, compression_ratio);
+
+                let checksum = compute_file_checksum(&file_full_path)?;
+                send_message(&mut file_send, &NetMessage::verify_result(true, checksum)).await?;
+                file_send.finish()?;
+
+                info!("  ✓ {} synced successfully", filename);
             }
-
-            drop(file);
-            rename(&temp_path, &file_full_path)?;
-
-            let checksum = compute_file_checksum(&file_full_path)?;
-            send_message(&mut file_send, &NetMessage::verify_result(true, checksum)).await?;
-            file_send.finish()?;
+            _ => {
+                error!("Expected Handshake or SendFullCompressed for file {}", file_path);
+                continue;
+            }
         }
-
-        info!("  ✓ {} synced successfully", filename);
     }
 
     let files_to_delete: Vec<String> = sync_plan.items.iter()
@@ -301,7 +376,6 @@ async fn handle_directory_sync(
 
     info!("Directory sync from {} completed successfully", remote_addr);
 
-    // Give time for final verification messages to be transmitted before closing connection
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     Ok(())
@@ -419,6 +493,80 @@ async fn handle_file_sync(
     }
 
     info!("File '{}' sync from {} completed", filename, remote_addr);
+    Ok(())
+}
+
+async fn handle_compressed_file_sync(
+    filename: String,
+    original_size: u64,
+    connection: &quinn::Connection,
+    send_stream: &mut quinn::SendStream,
+    _recv_stream: &mut quinn::RecvStream,
+    remote_addr: std::net::SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage_dir = PathBuf::from("./server_storage");
+    create_dir_all(&storage_dir)?;
+    let file_path = storage_dir.join(&filename);
+
+    info!("Receiving compressed file from {}...", remote_addr);
+    let upload_start = Instant::now();
+
+    let mut data_stream = connection.accept_uni().await?;
+
+    let mut compressed_data = Vec::new();
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+
+    loop {
+        match data_stream.read(&mut buffer).await {
+            Ok(Some(n)) => {
+                compressed_data.extend_from_slice(&buffer[..n]);
+            }
+            Ok(None) => break,
+            Err(e) => {
+                error!("Stream read error from {}: {}", remote_addr, e);
+                return Err(format!("Stream read error: {}", e).into());
+            }
+        }
+    }
+
+    info!("Decompressing file...");
+    let decompressed_data = zstd::decode_all(compressed_data.as_slice())
+        .map_err(|e| {
+            error!("Decompression failed from {}: {}", remote_addr, e);
+            format!("Decompression failed: {}", e)
+        })?;
+
+    if decompressed_data.len() as u64 != original_size {
+        error!("Size mismatch from {}: expected {}, got {}",
+               remote_addr, original_size, decompressed_data.len());
+        return Err(format!(
+            "Size mismatch: expected {}, got {}",
+            original_size, decompressed_data.len()
+        ).into());
+    }
+
+    let temp_path = storage_dir.join(format!("{}.tmp", filename));
+    let mut file = File::create(&temp_path)?;
+    file.write_all(&decompressed_data)?;
+    file.flush()?;
+    drop(file);
+
+    let upload_duration = upload_start.elapsed();
+    let compression_ratio = (compressed_data.len() as f64 / original_size as f64) * 100.0;
+    let throughput_mb = (original_size as f64 / 1_000_000.0) / upload_duration.as_secs_f64().max(0.001);
+
+    rename(&temp_path, &file_path)?;
+    info!("Compressed file '{}' uploaded successfully", filename);
+    info!("Original: {} bytes, Compressed: {} bytes ({:.1}% ratio)",
+          original_size, compressed_data.len(), compression_ratio);
+    info!("Upload complete: {:.2} MB/s, duration: {:.2}s", throughput_mb, upload_duration.as_secs_f64());
+
+    let checksum = compute_file_checksum(&file_path)?;
+    send_message(send_stream, &NetMessage::verify_result(true, checksum)).await?;
+    send_stream.finish()?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    info!("Compressed file '{}' sync from {} completed", filename, remote_addr);
     Ok(())
 }
 

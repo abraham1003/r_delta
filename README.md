@@ -6,8 +6,9 @@
 
 **r\_delta** is a high-performance, data transport engine that achieves **99%+ bandwidth savings** on incremental updates. It combines **Content-Defined Chunking (CDC)** for shift-resistant deduplication with **Zstd compression** and **SKIP optimization** for maximum efficiency.
 
-> **🚀 New in v0.1.3**
+> **v0.1.3 Features**
 > - ✅ **Parallel Directory Sync**: Concurrent file transfers (up to 50 files simultaneously) via futures::stream
+> - ✅ **Adaptive Transport Strategy**: Automatically uses Zstd compression for small files (< 100KB), bypassing CDC overhead for bandwidth savings and reduced latency
 >
 > **v0.1.2 Features** 
 > - ✅ **Directory Synchronization**: Sync entire directories with smart diff algorithm
@@ -28,6 +29,9 @@
 Most delta tools solve only half the problem (deduplication). `r_delta` solves the whole transport layer:
 
 * **Shift Resistant:** Uses FastCDC (Gear Hash) to align chunks based on content, not offsets.
+* **Adaptive Transport:** Intelligently chooses the optimal transfer strategy:
+    * *Small Files (< 100KB):* Direct Zstd compression (bypasses CDC overhead, 30-80% savings).
+    * *Large Files:* Full CDC pipeline with delta computation for maximum deduplication.
 * **Hybrid Efficiency:**
     * *Known Data:* Deduplicated via `COPY` instructions (O(1) HashMap lookup).
     * *New Data:* Compressed via `COMPRESSED_LITERAL` instructions (Zstd level 3).
@@ -167,15 +171,15 @@ Synchronize entire directory trees with intelligent manifest-based coordination 
 1. Client builds lightweight manifest (path, size, modified time, BLAKE3 checksum)
 2. Client connects to server and sends manifest via QUIC
 3. Server generates sync plan:
-   - **SendFull**: New files (upload entire file)
+   - **SendFull**: New files (upload entire file with adaptive strategy)
    - **SendDelta**: Modified files (compute and stream delta patch)
    - **Skip**: Identical files (verified by size + content hash)
    - **Delete**: Files on server but not in client (removed after sync completes)
 4. Client executes plan with parallelism:
    - Up to 50 concurrent file transfers simultaneously
    - Saturates bandwidth and hides network latency
-   - New files uploaded in full
-   - Modified files use delta for 50-99% bandwidth savings
+   - **Small files (< 100KB)**: Compressed direct upload (30-80% savings, reduced latency)
+   - **Large files**: Full CDC delta sync for maximum deduplication
    - Identical files skipped entirely
 5. Server applies changes and removes deleted files
 6. Both sides verify integrity via BLAKE3 checksums
@@ -217,33 +221,35 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 
 ### Feature Status
 
-| Feature                 | Status | Description                                    |
-|:------------------------|:------:|:-----------------------------------------------|
-| **FastCDC Engine**      |   ✅    | Gear Hash + dynamic cut-points                 |
-| **Shift Resistance**    |   ✅    | Handles insertions/deletions                   |
-| **Hybrid Compression**  |   ✅    | Zstd integration for literal runs              |
-| **SKIP Optimization**   |   ✅    | Merges consecutive COPYs (~5% gain)            |
-| **QUIC Configuration**  |   ✅    | Server/Client config generators                |
-| **File Sync**           |   ✅    | End-to-end network sync (`sync`)               |
-| **Directory Sync**      |   ✅    | **Phase 3** Multi-file sync with manifest      |
-| **Manifest Generation** |   ✅    | Fast walking with `.gitignore` + checksums     |
-| **Diff Algorithm**      |   ✅    | O(n log n) manifest comparison & sync actions  |
-| **Content Hashing**     |   ✅    | BLAKE3 checksums for reliable change detection |
-| **Sync Planning**       |   ✅    | Protocol for manifest exchange & coordination  |
-| **Parallel Transfer**   |   ✅    | futures::stream with 50-concurrent buffer |
+| Feature                   | Status | Description                                    |
+|:--------------------------|:------:|:-----------------------------------------------|
+| **FastCDC Engine**        |   ✅    | Gear Hash + dynamic cut-points                 |
+| **Shift Resistance**      |   ✅    | Handles insertions/deletions                   |
+| **Hybrid Compression**    |   ✅    | Zstd integration for literal runs              |
+| **SKIP Optimization**     |   ✅    | Merges consecutive COPYs (~5% gain)            |
+| **Adaptive Transport**    |   ✅    | Smart strategy selection based on file size    |
+| **QUIC Configuration**    |   ✅    | Server/Client config generators                |
+| **File Sync**             |   ✅    | End-to-end network sync (`sync`)               |
+| **Directory Sync**        |   ✅    | **Phase 3** Multi-file sync with manifest      |
+| **Manifest Generation**   |   ✅    | Fast walking with `.gitignore` + checksums     |
+| **Diff Algorithm**        |   ✅    | O(n log n) manifest comparison & sync actions  |
+| **Content Hashing**       |   ✅    | BLAKE3 checksums for reliable change detection |
+| **Sync Planning**         |   ✅    | Protocol for manifest exchange & coordination  |
+| **Parallel Transfer**     |   ✅    | futures::stream with 50-concurrent buffer      |
 
 ### Why r_delta is Fast
 
-1. **Content-Defined Chunking**: O(1) hash lookups for chunk matching
-2. **BLAKE3 Hashing**: SIMD-optimized cryptographic hashing (4-8x faster than SHA-256)
-3. **Zstd Compression**: Industry-leading decompression speed (~10x faster than gzip)
-4. **SKIP Optimization**: Reduces metadata overhead by ~5% for sequential regions
-5. **Streaming Architecture**: Constant memory usage regardless of file size
-6. **QUIC Protocol**: Multiplexed streams with 0-RTT connection establishment
-7. **Fast Directory Walking**: The `ignore` crate (ripgrep engine) with `.gitignore` awareness for quick manifests
-8. **Smart Diff Algorithm**: O(n log n) manifest comparison to identify only changed files
-9. **Selective File Transfer**: Skips unchanged files entirely, only syncs SendFull/SendDelta actions
-10. **Parallel Transfers**: Up to 50 concurrent files saturate bandwidth and hide latency costs
+1. **Adaptive Transport Strategy**: Automatically selects optimal transfer method (compression vs. delta) based on file size
+2. **Content-Defined Chunking**: O(1) hash lookups for chunk matching
+3. **BLAKE3 Hashing**: SIMD-optimized cryptographic hashing (4-8x faster than SHA-256)
+4. **Zstd Compression**: Industry-leading decompression speed (~10x faster than gzip)
+5. **SKIP Optimization**: Reduces metadata overhead by ~5% for sequential regions
+6. **Streaming Architecture**: Constant memory usage regardless of file size
+7. **QUIC Protocol**: Multiplexed streams with 0-RTT connection establishment
+8. **Fast Directory Walking**: The `ignore` crate (ripgrep engine) with `.gitignore` awareness for quick manifests
+9. **Smart Diff Algorithm**: O(n log n) manifest comparison to identify only changed files
+10. **Selective File Transfer**: Skips unchanged files entirely, only syncs SendFull/SendDelta actions
+11. **Parallel Transfers**: Up to 50 concurrent files saturate bandwidth and hide latency costs
 
 ## 📄 Licensing
 

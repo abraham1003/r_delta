@@ -194,6 +194,41 @@ async fn sync_single_file(
         .map_err(|e| format!("Failed to read file metadata: {}", e))?;
     let file_size = metadata.len();
 
+    const SMALL_FILE_THRESHOLD: u64 = 100 * 1024;
+
+    if file_size < SMALL_FILE_THRESHOLD {
+        if !silent { 
+            println!("  → Small file detected, using compressed upload"); 
+        }
+        
+        let (mut send_stream, mut recv_stream) = connection.open_bi().await
+            .map_err(|e| format!("Failed to open stream: {}", e))?;
+
+        let compressed_msg = r_delta_core::protocol::NetMessage::SendFullCompressed {
+            filename: relative_path.to_string(),
+            original_size: file_size,
+        };
+        send_message(&mut send_stream, &compressed_msg).await?;
+
+        handle_compressed_upload(file_path, connection).await?;
+
+        let verify_msg = receive_message(&mut recv_stream).await?;
+        match verify_msg {
+            r_delta_core::protocol::NetMessage::VerifyResult { matches, .. } => {
+                if matches {
+                    if !silent { println!("  ✓ Verified"); }
+                } else {
+                    return Err("Server verification failed".to_string());
+                }
+            }
+            _ => {
+                return Err("Expected verification result".to_string());
+            }
+        }
+
+        return Ok(());
+    }
+
     let (mut send_stream, mut recv_stream) = connection.open_bi().await
         .map_err(|e| format!("Failed to open stream: {}", e))?;
 
@@ -497,6 +532,54 @@ async fn handle_full_upload(
 
     pb.finish_and_clear();
     println!("✓ File uploaded: {}", format_bytes(total_sent as usize));
+
+    Ok(())
+}
+
+async fn handle_compressed_upload(
+    file: &PathBuf,
+    connection: &quinn::Connection,
+) -> Result<(), String> {
+    let file_size = std::fs::metadata(file)
+        .map_err(|e| format!("Failed to get file size: {}", e))?
+        .len();
+
+    println!("\n→ Uploading compressed file...");
+
+    let mut file_data = Vec::new();
+    let mut file_reader = File::open(file)
+        .map_err(|e| format!("Failed to open file: {}", e))?;
+    file_reader.read_to_end(&mut file_data)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let compressed_data = zstd::encode_all(file_data.as_slice(), 3)
+        .map_err(|e| format!("Failed to compress file: {}", e))?;
+
+    let pb = ProgressBar::new(compressed_data.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("█▓░")
+    );
+
+    let mut data_stream = connection.open_uni().await
+        .map_err(|e| format!("Failed to open data stream: {}", e))?;
+
+    data_stream.write_all(&compressed_data).await
+        .map_err(|e| format!("Failed to write to stream: {}", e))?;
+    pb.set_position(compressed_data.len() as u64);
+
+    data_stream.finish()
+        .map_err(|e| format!("Failed to close data stream: {}", e))?;
+
+    pb.finish_and_clear();
+    
+    let compression_ratio = (compressed_data.len() as f64 / file_size as f64) * 100.0;
+    println!("✓ File compressed and uploaded: {} → {} ({:.1}%)", 
+             format_bytes(file_size as usize),
+             format_bytes(compressed_data.len()),
+             compression_ratio);
 
     Ok(())
 }
