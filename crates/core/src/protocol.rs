@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use bincode::{Encode, Decode};
 use crate::signature::ChunkSignature;
+use crate::manifest::FileEntry;
+use crate::diff::SyncItem;
 
 const PROTOCOL_VERSION: u16 = 1;
 
@@ -28,6 +30,14 @@ pub enum NetMessage {
     },
     Error {
         message: String,
+    },
+    ManifestRequest,
+    ManifestPacket {
+        entries: Vec<FileEntry>,
+    },
+    ManifestEnd,
+    SyncPlan {
+        items: Vec<SyncItem>,
     },
 }
 
@@ -86,6 +96,14 @@ impl NetMessage {
 
     pub fn error(message: String) -> Self {
         Self::Error { message }
+    }
+
+    pub fn manifest_packet(entries: Vec<FileEntry>) -> Self {
+        Self::ManifestPacket { entries }
+    }
+
+    pub fn sync_plan(items: Vec<SyncItem>) -> Self {
+        Self::SyncPlan { items }
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
@@ -161,6 +179,49 @@ mod tests {
             NetMessage::VerifyResult { matches, checksum: chk } => {
                 assert!(matches);
                 assert_eq!(chk, checksum);
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn test_manifest_packet_serialization() {
+        use crate::manifest::FileEntry;
+        
+        let entries = vec![
+            FileEntry::new("file1.txt".to_string(), 100, 1000, false),
+            FileEntry::new("file2.txt".to_string(), 200, 2000, false),
+        ];
+        let msg = NetMessage::manifest_packet(entries.clone());
+        let serialized = msg.serialize().expect("Failed to serialize");
+        let deserialized = NetMessage::deserialize(&serialized).expect("Failed to deserialize");
+
+        match deserialized {
+            NetMessage::ManifestPacket { entries: deserialized_entries } => {
+                assert_eq!(deserialized_entries.len(), 2);
+                assert_eq!(deserialized_entries[0].path, "file1.txt");
+                assert_eq!(deserialized_entries[1].path, "file2.txt");
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn test_sync_plan_serialization() {
+        use crate::diff::{SyncItem, SyncAction};
+        
+        let items = vec![
+            SyncItem::new("file1.txt".to_string(), SyncAction::SendFull),
+            SyncItem::new("file2.txt".to_string(), SyncAction::Skip),
+        ];
+        let msg = NetMessage::sync_plan(items);
+        let serialized = msg.serialize().expect("Failed to serialize");
+        let deserialized = NetMessage::deserialize(&serialized).expect("Failed to deserialize");
+
+        match deserialized {
+            NetMessage::SyncPlan { items: deserialized_items } => {
+                assert_eq!(deserialized_items.len(), 2);
+                assert_eq!(deserialized_items[0].path, "file1.txt");
             }
             _ => panic!("Wrong message type"),
         }

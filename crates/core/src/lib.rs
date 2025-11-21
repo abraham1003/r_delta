@@ -5,3 +5,5 @@ pub mod patch;
 pub mod verify;
 pub mod protocol;
 pub mod network;
+pub mod manifest;
+pub mod diff;

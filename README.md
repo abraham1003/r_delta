@@ -13,6 +13,9 @@
 > - ✅ **SKIP Optimization**: Additional 5% patch size reduction for large sequential regions
 > - ✅ **Telemetry**: Structured logging with performance metrics (throughput, duration, savings)
 > - ✅ **Forensic Verification**: Bit-level integrity checking
+> - ✅ **Fast Directory Walking**: Manifest generation with `.gitignore` support using `ignore` crate
+> - ✅ **Smart Diff Algorithm**: Compares manifests to determine sync actions (SendFull, SendDelta, Skip, Delete)
+> - ✅ **Sync Planning**: Protocol extensions for manifest exchange and sync coordination
 
 ## ⚡ Why r\_delta?
 
@@ -145,6 +148,12 @@ The sync command orchestrates the entire pipeline:
 4. Client streams optimized patch to server
 5. Server reconstructs and verifies
 
+For directory sync, the protocol additionally:
+1. Client builds lightweight manifest (path, size, modified time)
+2. Server receives manifest and compares with local version
+3. Server generates sync plan: SendFull (new), SendDelta (changed), Skip (identical), Delete (removed)
+4. Client executes plan with parallel thread pool for optimal bandwidth utilization
+
 ```bash
 ./target/release/r_delta sync <FILE> <SERVER:PORT>
 ```
@@ -182,18 +191,18 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 
 ### Feature Status
 
-| Feature                   | Status | Description                                     |
-|:--------------------------|:------:|:------------------------------------------------|
-| **FastCDC Engine**        |   ✅    | Gear Hash + dynamic cut-points                  |
-| **Shift Resistance**      |   ✅    | Handles insertions/deletions                    |
-| **Hybrid Compression**    |   ✅    | Zstd integration for literal runs               |
-| **SKIP Optimization**     |   ✅    | **v0.1.2** Merges consecutive COPYs (~5% gain)  |
-| **Progress Bars**         |   ✅    | **v0.1.2** Real-time visual feedback            |
-| **Deduplication Report**  |   ✅    | **v0.1.2** Shows bandwidth savings              |
-| **Structured Logging**    |   ✅    | **v0.1.2** Telemetry & metrics       |
-| **QUIC Configuration**    |   ✅    | Server/Client config generators                 |
-| **Remote Sync**           |   ✅    | End-to-end network sync (`sync`)                |
-| **Multi-file Sync**       |   ⬜    | Directory/repository synchronization            |
+| Feature                 | Status | Description                                    |
+|:------------------------|:------:|:-----------------------------------------------|
+| **FastCDC Engine**      |   ✅    | Gear Hash + dynamic cut-points                 |
+| **Shift Resistance**    |   ✅    | Handles insertions/deletions                   |
+| **Hybrid Compression**  |   ✅    | Zstd integration for literal runs              |
+| **SKIP Optimization**   |   ✅    | **v0.1.2** Merges consecutive COPYs (~5% gain) |
+| **QUIC Configuration**  |   ✅    | Server/Client config generators                |
+| **Remote Sync**         |   ✅    | End-to-end network sync (`sync`)               |
+| **Manifest Generation** |   ✅    | Fast directory walking with filters            |
+| **Diff Algorithm**      |   ✅    | File comparison & sync actions                 |
+| **Sync Planning**       |   ✅    | Protocol for coordination                      |
+| **Multi-file Sync**     |  🏗️   | Directory sync with thread pool                |
 
 ### Why r_delta is Fast
 
@@ -203,6 +212,9 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 4. **SKIP Optimization**: Reduces metadata overhead by ~5% for sequential regions
 5. **Streaming Architecture**: Constant memory usage regardless of file size
 6. **QUIC Protocol**: Multiplexed streams with 0-RTT connection establishment
+7. **Fast Directory Walking**: The `ignore` crate (ripgrep engine) with `.gitignore` awareness for quick manifests
+8. **Smart Diff Algorithm**: O(n log n) manifest comparison to identify only changed files
+9. **Selective File Transfer**: Skips unchanged files entirely, only syncs SendFull/SendDelta actions
 
 ## 📄 Licensing
 

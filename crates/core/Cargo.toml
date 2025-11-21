@@ -15,6 +15,9 @@ quinn.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+ignore.workspace = true
+rayon.workspace = true
+pathdiff.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
