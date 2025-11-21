@@ -92,8 +92,21 @@ pub fn diff(client_manifest: &Manifest, server_manifest: &Manifest) -> SyncPlan 
         let action = match server_map.get(client_entry.path.as_str()) {
             None => SyncAction::SendFull,
             Some(server_entry) => {
-                if client_entry.size == server_entry.size 
-                    && client_entry.modified == server_entry.modified {
+                // First check: size must match
+                if client_entry.size != server_entry.size {
+                    SyncAction::SendDelta
+                }
+                // Second check: if both have checksums, compare them
+                else if let (Some(client_checksum), Some(server_checksum)) = 
+                    (&client_entry.checksum, &server_entry.checksum) {
+                    if client_checksum == server_checksum {
+                        SyncAction::Skip
+                    } else {
+                        SyncAction::SendDelta
+                    }
+                }
+                // Fallback: compare timestamps (less reliable but faster)
+                else if client_entry.modified == server_entry.modified {
                     SyncAction::Skip
                 } else {
                     SyncAction::SendDelta

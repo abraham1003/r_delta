@@ -62,6 +62,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -793,6 +799,7 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 name = "r_delta_client"
 version = "0.1.2"
 dependencies = [
+ "anyhow",
  "blake3",
  "clap",
  "console",
@@ -829,6 +836,7 @@ dependencies = [
 name = "r_delta_server"
 version = "0.1.2"
 dependencies = [
+ "anyhow",
  "blake3",
  "quinn",
  "r_delta_core",

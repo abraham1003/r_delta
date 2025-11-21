@@ -4,6 +4,8 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use bincode::{Encode, Decode};
 use ignore::WalkBuilder;
+use std::fs::File;
+use std::io::Read;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Encode, Decode, PartialEq, Eq)]
 pub struct FileEntry {
@@ -11,6 +13,7 @@ pub struct FileEntry {
     pub size: u64,
     pub modified: u64,
     pub is_dir: bool,
+    pub checksum: Option<[u8; 32]>,
 }
 
 impl FileEntry {
@@ -20,6 +23,7 @@ impl FileEntry {
             size,
             modified,
             is_dir,
+            checksum: None,
         }
     }
 
@@ -36,7 +40,27 @@ impl FileEntry {
             size,
             modified,
             is_dir,
+            checksum: None,
         })
+    }
+
+    pub fn with_checksum(mut self, file_path: &Path) -> io::Result<Self> {
+        if !self.is_dir && self.size > 0 {
+            let mut file = File::open(file_path)?;
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = vec![0u8; 64 * 1024];
+            
+            loop {
+                let n = file.read(&mut buffer)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..n]);
+            }
+            
+            self.checksum = Some(*hasher.finalize().as_bytes());
+        }
+        Ok(self)
     }
 }
 
@@ -119,10 +143,22 @@ impl Manifest {
                     Err(e) => return Some(Err(io::Error::new(io::ErrorKind::Other, e))),
                 };
 
-                match FileEntry::from_metadata(relative_path, &metadata) {
-                    Ok(file_entry) => Some(Ok(file_entry)),
-                    Err(e) => Some(Err(e)),
-                }
+                let file_entry = match FileEntry::from_metadata(relative_path, &metadata) {
+                    Ok(e) => e,
+                    Err(e) => return Some(Err(e)),
+                };
+
+                // Compute checksum for files (not directories)
+                let file_entry_with_checksum = if !file_entry.is_dir {
+                    match file_entry.with_checksum(path) {
+                        Ok(e) => e,
+                        Err(e) => return Some(Err(e)),
+                    }
+                } else {
+                    file_entry
+                };
+
+                Some(Ok(file_entry_with_checksum))
             })
             .collect();
 

@@ -6,6 +6,208 @@ use std::fs::File;
 use std::io::{Read, BufReader};
 use indicatif::{ProgressBar, ProgressStyle};
 use console::style;
+use anyhow::Result;
+
+async fn handle_sync_dir(directory: PathBuf, server: String) -> Result<(), String> {
+    if !directory.exists() {
+        return Err(format!("Directory '{}' does not exist", directory.display()));
+    }
+    if !directory.is_dir() {
+        return Err(format!("'{}' is not a directory", directory.display()));
+    }
+
+    println!("Synchronizing directory to server...");
+    println!("  Directory: '{}'", directory.display());
+    println!("  Server: {}", server);
+
+    let start = Instant::now();
+
+    println!("\n→ Scanning directory and building manifest...");
+    let manifest = r_delta_core::manifest::Manifest::generate(&directory)
+        .map_err(|e| format!("Failed to generate manifest: {}", e))?;
+
+    println!("✓ Found {} items ({} total)", 
+        manifest.len(), 
+        format_bytes(manifest.total_size() as usize));
+
+    let client_config = r_delta_core::network::generate_client_config()
+        .map_err(|e| format!("Failed to create client config: {}", e))?;
+
+    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
+        .map_err(|e| format!("Failed to create endpoint: {}", e))?;
+    endpoint.set_default_client_config(client_config);
+
+    let connection = endpoint.connect(server.parse().unwrap(), "localhost")
+        .map_err(|e| format!("Failed to initiate connection: {}", e))?
+        .await
+        .map_err(|e| format!("Connection failed: {}", e))?;
+
+    println!("✓ Connected to server");
+
+    let (mut send_stream, mut recv_stream) = connection.open_bi().await
+        .map_err(|e| format!("Failed to open control stream: {}", e))?;
+
+    send_message(&mut send_stream, &r_delta_core::protocol::NetMessage::ManifestRequest).await?;
+
+    println!("\n→ Sending manifest to server...");
+    const MANIFEST_BATCH_SIZE: usize = 100;
+    for chunk in manifest.entries.chunks(MANIFEST_BATCH_SIZE) {
+        let packet = r_delta_core::protocol::NetMessage::manifest_packet(chunk.to_vec());
+        send_message(&mut send_stream, &packet).await?;
+    }
+    send_message(&mut send_stream, &r_delta_core::protocol::NetMessage::ManifestEnd).await?;
+    println!("✓ Manifest sent");
+
+    println!("\n→ Waiting for sync plan from server...");
+    let plan_msg = receive_message(&mut recv_stream).await?;
+    
+    let sync_plan = match plan_msg {
+        r_delta_core::protocol::NetMessage::SyncPlan { items } => {
+            r_delta_core::diff::SyncPlan::new(items)
+        }
+        r_delta_core::protocol::NetMessage::Error { message } => {
+            return Err(format!("Server error: {}", message));
+        }
+        _ => {
+            return Err("Expected SyncPlan message".to_string());
+        }
+    };
+
+    let counts = sync_plan.count_by_action();
+    println!("✓ Sync plan received:");
+    if let Some(&count) = counts.get("SendFull") {
+        println!("  → {} files to upload (new)", count);
+    }
+    if let Some(&count) = counts.get("SendDelta") {
+        println!("  → {} files to sync (modified)", count);
+    }
+    if let Some(&count) = counts.get("Skip") {
+        println!("  → {} files to skip (identical)", count);
+    }
+    if let Some(&count) = counts.get("Delete") {
+        println!("  → {} files to delete", count);
+    }
+
+    let files_to_sync = r_delta_core::diff::get_files_to_sync(&sync_plan);
+    let files_to_delete: Vec<String> = sync_plan.items.iter()
+        .filter(|item| matches!(item.action, r_delta_core::diff::SyncAction::Delete))
+        .map(|item| item.path.clone())
+        .collect();
+    
+    if files_to_sync.is_empty() && files_to_delete.is_empty() {
+        println!("\n✓ All files are up to date!");
+        let duration = start.elapsed();
+        println!("  Total time: {}", format_duration(duration));
+        return Ok(());
+    }
+
+    if !files_to_sync.is_empty() {
+        println!("\n→ Syncing {} files...", files_to_sync.len());
+    }
+    
+    for (idx, file_path) in files_to_sync.iter().enumerate() {
+        let action = sync_plan.items.iter()
+            .find(|item| &item.path == file_path)
+            .map(|item| &item.action);
+
+        let full_path = directory.join(file_path);
+        
+        println!("\n[{}/{}] {}", 
+            idx + 1, 
+            files_to_sync.len(), 
+            file_path);
+
+        match action {
+            Some(r_delta_core::diff::SyncAction::SendFull) => {
+                sync_single_file(&full_path, file_path, &connection, false).await?;
+            }
+            Some(r_delta_core::diff::SyncAction::SendDelta) => {
+                sync_single_file(&full_path, file_path, &connection, true).await?;
+            }
+            _ => {
+                println!("  ⊘ Skipped");
+            }
+        }
+    }
+
+    if !files_to_delete.is_empty() {
+        println!("\n→ Server will delete {} obsolete files", files_to_delete.len());
+        for file_path in &files_to_delete {
+            println!("  ✗ {}", file_path);
+        }
+    }
+
+    let duration = start.elapsed();
+    println!("\n✓ Directory synchronization complete!");
+    println!("  Total time: {}", format_duration(duration));
+    println!("  Files processed: {}", files_to_sync.len());
+
+    connection.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    Ok(())
+}
+
+async fn sync_single_file(
+    file_path: &PathBuf,
+    relative_path: &str,
+    connection: &quinn::Connection,
+    use_delta: bool,
+) -> Result<(), String> {
+    let metadata = std::fs::metadata(file_path)
+        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+    let file_size = metadata.len();
+
+    let (mut send_stream, mut recv_stream) = connection.open_bi().await
+        .map_err(|e| format!("Failed to open stream: {}", e))?;
+
+    let handshake = r_delta_core::protocol::NetMessage::handshake(
+        relative_path.to_string(), 
+        file_size
+    );
+    send_message(&mut send_stream, &handshake).await?;
+
+    let ack = receive_message(&mut recv_stream).await?;
+
+    match ack {
+        r_delta_core::protocol::NetMessage::HandshakeAck { has_old_file } => {
+            if has_old_file && use_delta {
+                println!("  → Delta sync");
+                handle_differential_sync(
+                    file_path,
+                    connection,
+                    &mut send_stream,
+                    &mut recv_stream,
+                ).await?;
+            } else {
+                println!("  → Full upload");
+                handle_full_upload(file_path, connection).await?;
+            }
+        }
+        r_delta_core::protocol::NetMessage::Error { message } => {
+            return Err(format!("Server error: {}", message));
+        }
+        _ => {
+            return Err("Unexpected response from server".to_string());
+        }
+    }
+
+    let verify_msg = receive_message(&mut recv_stream).await?;
+    match verify_msg {
+        r_delta_core::protocol::NetMessage::VerifyResult { matches, .. } => {
+            if matches {
+                println!("  ✓ Verified");
+            } else {
+                return Err("Server verification failed".to_string());
+            }
+        }
+        _ => {
+            return Err("Expected verification result".to_string());
+        }
+    }
+
+    Ok(())
+}
 
 async fn handle_sync(file: PathBuf, server: String) -> Result<(), String> {
     validate_file_exists(&file, "File")?;
@@ -404,6 +606,15 @@ enum Commands {
         server: String,
     },
 
+    #[command(about = "Sync directory to remote server")]
+    SyncDir {
+        #[arg(value_name = "DIRECTORY", help = "Directory to synchronize")]
+        directory: PathBuf,
+
+        #[arg(value_name = "SERVER", help = "Server address (IP:PORT)")]
+        server: String,
+    },
+
     #[command(about = "Generate signature file from source file")]
     Signature {
         #[arg(value_name = "INPUT_FILE", help = "Source file to create signature from")]
@@ -684,6 +895,13 @@ fn main() {
         Commands::Sync { file, server } => {
             match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt.block_on(handle_sync(file, server)),
+                Err(e) => Err(format!("Failed to create async runtime: {}", e)),
+            }
+        }
+
+        Commands::SyncDir { directory, server } => {
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt.block_on(handle_sync_dir(directory, server)),
                 Err(e) => Err(format!("Failed to create async runtime: {}", e)),
             }
         }

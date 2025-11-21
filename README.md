@@ -6,16 +6,19 @@
 
 **r\_delta** is a high-performance, data transport engine that achieves **99%+ bandwidth savings** on incremental updates. It combines **Content-Defined Chunking (CDC)** for shift-resistant deduplication with **Zstd compression** and **SKIP optimization** for maximum efficiency.
 
-> **🚀 New in v0.1.2:** 
+> **🚀 New in v0.1.2** 
+> - ✅ **Directory Synchronization**: Sync entire directories with smart diff algorithm
+> - ✅ **Manifest Generation**: Fast directory walking with `.gitignore` support (ignore crate)
 > - ✅ **Hybrid Compression**: Zstd integration for optimal patch sizes
 > - ✅ **Network Sync**: Full QUIC-based client-server architecture with cryptographic verification
 > - ✅ **Professional UX**: Real-time progress bars, spinners, and deduplication reports
 > - ✅ **SKIP Optimization**: Additional 5% patch size reduction for large sequential regions
 > - ✅ **Telemetry**: Structured logging with performance metrics (throughput, duration, savings)
 > - ✅ **Forensic Verification**: Bit-level integrity checking
-> - ✅ **Fast Directory Walking**: Manifest generation with `.gitignore` support using `ignore` crate
-> - ✅ **Smart Diff Algorithm**: Compares manifests to determine sync actions (SendFull, SendDelta, Skip, Delete)
-> - ✅ **Sync Planning**: Protocol extensions for manifest exchange and sync coordination
+> - ✅ **Content-Based Checksums**: BLAKE3 hashing for reliable file change detection
+> - ✅ **Smart Diff Algorithm**: O(n log n) manifest comparison with SendFull, SendDelta, Skip, Delete actions
+> - ✅ **File Deletion Handling**: Removes server files not in client manifest
+> - ✅ **Sync Planning**: Protocol extensions for manifest exchange and multi-file coordination
 
 ## ⚡ Why r\_delta?
 
@@ -139,7 +142,9 @@ Perform a high-speed, streaming bit-for-bit comparison to prove integrity.
 
 ### 5\. Sync (The Network Transport)
 
-Synchronize a file to a remote server using automatic delta detection and compression.
+Synchronize files to a remote server using automatic delta detection and compression.
+
+#### File Sync
 
 The sync command orchestrates the entire pipeline:
 1. Connects to the server
@@ -148,23 +153,38 @@ The sync command orchestrates the entire pipeline:
 4. Client streams optimized patch to server
 5. Server reconstructs and verifies
 
-For directory sync, the protocol additionally:
-1. Client builds lightweight manifest (path, size, modified time)
-2. Server receives manifest and compares with local version
-3. Server generates sync plan: SendFull (new), SendDelta (changed), Skip (identical), Delete (removed)
-4. Client executes plan with parallel thread pool for optimal bandwidth utilization
-
 ```bash
 ./target/release/r_delta sync <FILE> <SERVER:PORT>
 ```
+
+#### Directory Sync
+
+Synchronize entire directory trees with intelligent manifest-based coordination:
+
+1. Client builds lightweight manifest (path, size, modified time, BLAKE3 checksum)
+2. Client connects to server and sends manifest via QUIC
+3. Server generates sync plan:
+   - **SendFull**: New files (upload entire file)
+   - **SendDelta**: Modified files (compute and stream delta patch)
+   - **Skip**: Identical files (verified by size + content hash)
+   - **Delete**: Files on server but not in client (removed after sync completes)
+4. Client executes plan:
+   - New files uploaded in full
+   - Modified files use delta for 50-99% bandwidth savings
+   - Identical files skipped entirely
+5. Server applies changes and removes deleted files
+6. Both sides verify integrity via BLAKE3 checksums
 
 **Example:**
 ```bash
 # Server (runs continuously)
 ./target/release/r_delta_server
 
-# Client (in another terminal)
+# Client (in another terminal) - Single file
 ./target/release/r_delta sync file.bin 127.0.0.1:4433
+
+# Client (in another terminal) - Entire directory
+./target/release/r_delta sync-dir /path/to/directory 127.0.0.1:4433
 ```
 
 ## 🗺 Roadmap & Architecture
@@ -196,13 +216,15 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 | **FastCDC Engine**      |   ✅    | Gear Hash + dynamic cut-points                 |
 | **Shift Resistance**    |   ✅    | Handles insertions/deletions                   |
 | **Hybrid Compression**  |   ✅    | Zstd integration for literal runs              |
-| **SKIP Optimization**   |   ✅    | **v0.1.2** Merges consecutive COPYs (~5% gain) |
+| **SKIP Optimization**   |   ✅    | Merges consecutive COPYs (~5% gain)            |
 | **QUIC Configuration**  |   ✅    | Server/Client config generators                |
-| **Remote Sync**         |   ✅    | End-to-end network sync (`sync`)               |
-| **Manifest Generation** |   ✅    | Fast directory walking with filters            |
-| **Diff Algorithm**      |   ✅    | File comparison & sync actions                 |
-| **Sync Planning**       |   ✅    | Protocol for coordination                      |
-| **Multi-file Sync**     |  🏗️   | Directory sync with thread pool                |
+| **File Sync**           |   ✅    | End-to-end network sync (`sync`)               |
+| **Directory Sync**      |   ✅    | **Phase 3** Multi-file sync with manifest      |
+| **Manifest Generation** |   ✅    | Fast walking with `.gitignore` + checksums     |
+| **Diff Algorithm**      |   ✅    | O(n log n) manifest comparison & sync actions  |
+| **Content Hashing**     |   ✅    | BLAKE3 checksums for reliable change detection |
+| **Sync Planning**       |   ✅    | Protocol for manifest exchange & coordination  |
+| **Parallel Transfer**   |  🏗️   | Thread pool for concurrent sync    |
 
 ### Why r_delta is Fast
 
