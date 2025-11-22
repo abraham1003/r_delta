@@ -8,6 +8,8 @@ pub mod network;
 pub mod manifest;
 pub mod diff;
 pub mod crypto;
+pub mod encryption;
+pub mod pipeline;
 
 #[cfg(test)]
 mod chaos_tests {

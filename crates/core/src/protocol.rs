@@ -12,6 +12,7 @@ pub enum NetMessage {
         filename: String,
         file_size: u64,
         protocol_version: u16,
+        is_encrypted: bool,
     },
     HandshakeAck {
         has_old_file: bool,
@@ -42,6 +43,11 @@ pub enum NetMessage {
     SendFullCompressed {
         filename: String,
         original_size: u64,
+    },
+    SendFullEncrypted {
+        filename: String,
+        original_size: u64,
+        encrypted_size: u64,
     },
 }
 
@@ -81,6 +87,16 @@ impl NetMessage {
             filename,
             file_size,
             protocol_version: PROTOCOL_VERSION,
+            is_encrypted: false,
+        }
+    }
+
+    pub fn handshake_encrypted(filename: String, file_size: u64) -> Self {
+        Self::Handshake {
+            filename,
+            file_size,
+            protocol_version: PROTOCOL_VERSION,
+            is_encrypted: true,
         }
     }
 
@@ -110,6 +126,14 @@ impl NetMessage {
         Self::SyncPlan { items }
     }
 
+    pub fn send_full_encrypted(filename: String, original_size: u64, encrypted_size: u64) -> Self {
+        Self::SendFullEncrypted {
+            filename,
+            original_size,
+            encrypted_size,
+        }
+    }
+
     pub fn serialize(&self) -> Result<Vec<u8>, bincode::error::EncodeError> {
         bincode::encode_to_vec(self, bincode::config::standard())
     }
@@ -135,10 +159,11 @@ mod tests {
         let deserialized = NetMessage::deserialize(&serialized).expect("Failed to deserialize");
 
         match deserialized {
-            NetMessage::Handshake { filename, file_size, protocol_version } => {
+            NetMessage::Handshake { filename, file_size, protocol_version, is_encrypted } => {
                 assert_eq!(filename, "test.bin");
                 assert_eq!(file_size, 1024);
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert!(!is_encrypted);
             }
             _ => panic!("Wrong message type"),
         }
