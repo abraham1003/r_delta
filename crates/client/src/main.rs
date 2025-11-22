@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Instant;
 use std::fs::File;
-use std::io::{Read, BufReader};
+use std::io::{Read, BufReader, Seek};
 use indicatif::{ProgressBar, ProgressStyle};
 use console::style;
 use anyhow::Result;
@@ -227,7 +227,7 @@ async fn sync_single_file(
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
         if let Some(key) = key_context {
-            handle_encrypted_upload(file_path, &relative_path, connection, &mut send_stream, &mut recv_stream, key).await?;
+            handle_encrypted_upload(file_path, &relative_path, connection, &mut send_stream, &mut recv_stream, key, 0).await?;
             if !silent { println!("  ✓ Verified"); }
         } else {
             let compressed_msg = r_delta_core::protocol::NetMessage::SendFullCompressed {
@@ -274,7 +274,10 @@ async fn sync_single_file(
     let ack = receive_message(&mut recv_stream).await?;
 
     match ack {
-        r_delta_core::protocol::NetMessage::HandshakeAck { has_old_file } => {
+        r_delta_core::protocol::NetMessage::HandshakeAck { has_old_file, resume_offset } => {
+            if resume_offset > 0 {
+                if !silent { println!("  → Resuming from {} bytes", format_bytes(resume_offset as usize)); }
+            }
             if has_old_file && use_delta {
                 if !silent { 
                     if key_context.is_some() {
@@ -299,9 +302,9 @@ async fn sync_single_file(
                     }
                 }
                 if let Some(key) = key_context {
-                    handle_encrypted_upload(file_path, &relative_path, connection, &mut send_stream, &mut recv_stream, key).await?;
+                    handle_encrypted_upload(file_path, &relative_path, connection, &mut send_stream, &mut recv_stream, key, resume_offset).await?;
                 } else {
-                    handle_full_upload(file_path, connection).await?;
+                    handle_full_upload(file_path, connection, resume_offset).await?;
                 }
             }
         }
@@ -388,9 +391,12 @@ async fn handle_sync(file: PathBuf, server: String, encrypt: bool, key_path: Opt
     let ack = receive_message(&mut recv_stream).await?;
 
     match ack {
-        r_delta_core::protocol::NetMessage::HandshakeAck { has_old_file } => {
+        r_delta_core::protocol::NetMessage::HandshakeAck { has_old_file, resume_offset } => {
             println!("✓ Handshake complete");
             println!("  Server has old version: {}", if has_old_file { "yes" } else { "no" });
+            if resume_offset > 0 {
+                println!("  Resuming from: {}", format_bytes(resume_offset as usize));
+            }
 
             if has_old_file {
                 let verification_already_read = handle_differential_sync(
@@ -425,12 +431,12 @@ async fn handle_sync(file: PathBuf, server: String, encrypt: bool, key_path: Opt
                 }
             } else {
                 if let Some(key) = &key_context {
-                    handle_encrypted_upload(&file, &filename, &connection, &mut send_stream, &mut recv_stream, key).await?;
+                    handle_encrypted_upload(&file, &filename, &connection, &mut send_stream, &mut recv_stream, key, resume_offset).await?;
                     let duration = start.elapsed();
                     println!("\n✓ Synchronization complete!");
                     println!("  Total time: {}", format_duration(duration));
                 } else {
-                    handle_full_upload(&file, &connection).await?;
+                    handle_full_upload(&file, &connection, resume_offset).await?;
                     
                     let verify_msg = receive_message(&mut recv_stream).await?;
                     match verify_msg {
@@ -650,12 +656,17 @@ async fn handle_encrypted_differential_sync(
 async fn handle_full_upload(
     file: &PathBuf,
     connection: &quinn::Connection,
+    resume_offset: u64,
 ) -> Result<(), String> {
     let file_size = std::fs::metadata(file)
         .map_err(|e| format!("Failed to get file size: {}", e))?
         .len();
 
-    println!("\n→ Uploading full file...");
+    if resume_offset > 0 {
+        println!("\n→ Resuming upload from {} bytes...", format_bytes(resume_offset as usize));
+    } else {
+        println!("\n→ Uploading full file...");
+    }
 
     let pb = ProgressBar::new(file_size);
     pb.set_style(
@@ -664,15 +675,21 @@ async fn handle_full_upload(
             .unwrap()
             .progress_chars("█▓░")
     );
+    pb.set_position(resume_offset);
 
     let mut data_stream = connection.open_uni().await
         .map_err(|e| format!("Failed to open data stream: {}", e))?;
 
     let mut file_reader = BufReader::new(File::open(file)
         .map_err(|e| format!("Failed to open file: {}", e))?);
+    
+    if resume_offset > 0 {
+        file_reader.seek(std::io::SeekFrom::Start(resume_offset))
+            .map_err(|e| format!("Failed to seek file: {}", e))?;
+    }
 
     let mut buffer = vec![0u8; 64 * 1024];
-    let mut total_sent = 0u64;
+    let mut total_sent = resume_offset;
 
     loop {
         let n = file_reader.read(&mut buffer)
@@ -751,16 +768,27 @@ async fn handle_encrypted_upload(
     send_stream: &mut quinn::SendStream,
     recv_stream: &mut quinn::RecvStream,
     key: &KeyContext,
+    resume_offset: u64,
 ) -> Result<(), String> {
     let file_size = std::fs::metadata(file)
         .map_err(|e| format!("Failed to get file size: {}", e))?
         .len();
 
-    println!("\n→ Encrypting file...");
+    if resume_offset > 0 {
+        println!("\n→ Resuming encrypted upload from {} bytes...", format_bytes(resume_offset as usize));
+    } else {
+        println!("\n→ Encrypting file...");
+    }
 
     let mut file_data = Vec::new();
     let mut file_reader = File::open(file)
         .map_err(|e| format!("Failed to open file: {}", e))?;
+    
+    if resume_offset > 0 {
+        file_reader.seek(std::io::SeekFrom::Start(resume_offset))
+            .map_err(|e| format!("Failed to seek file: {}", e))?;
+    }
+    
     file_reader.read_to_end(&mut file_data)
         .map_err(|e| format!("Failed to read file: {}", e))?;
 

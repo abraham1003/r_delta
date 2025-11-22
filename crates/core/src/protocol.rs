@@ -16,6 +16,7 @@ pub enum NetMessage {
     },
     HandshakeAck {
         has_old_file: bool,
+        resume_offset: u64,
     },
     RequestSignature,
     SignaturePacket {
@@ -100,8 +101,8 @@ impl NetMessage {
         }
     }
 
-    pub fn handshake_ack(has_old_file: bool) -> Self {
-        Self::HandshakeAck { has_old_file }
+    pub fn handshake_ack(has_old_file: bool, resume_offset: u64) -> Self {
+        Self::HandshakeAck { has_old_file, resume_offset }
     }
 
     pub fn signature_packet(signatures: Vec<ChunkSignature>) -> Self {
@@ -171,13 +172,14 @@ mod tests {
 
     #[test]
     fn test_handshake_ack_serialization() {
-        let msg = NetMessage::handshake_ack(true);
+        let msg = NetMessage::handshake_ack(true, 1024);
         let serialized = msg.serialize().expect("Failed to serialize");
         let deserialized = NetMessage::deserialize(&serialized).expect("Failed to deserialize");
 
         match deserialized {
-            NetMessage::HandshakeAck { has_old_file } => {
+            NetMessage::HandshakeAck { has_old_file, resume_offset } => {
                 assert!(has_old_file);
+                assert_eq!(resume_offset, 1024);
             }
             _ => panic!("Wrong message type"),
         }

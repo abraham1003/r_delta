@@ -12,6 +12,7 @@
 > - ✅ **End-to-End Encryption**: XChaCha20-Poly1305 authenticated encryption with client-side key management
 > - ✅ **Encrypted Full File Upload**: First sync encrypts and uploads encrypted blob (opaque server storage)
 > - ✅ **Encrypted Differential Sync**: Updates to encrypted files maintain zero-knowledge encryption
+> - ✅ **Resumable Transfers**: Interrupted uploads resume from last checkpoint instead of restarting (for both encrypted and unencrypted files)
 >
 > **v0.1.2 Features** 
 > - ✅ **Directory Synchronization**: Sync entire directories with smart diff algorithm
@@ -34,6 +35,7 @@ Most delta tools solve only half the problem (deduplication). `r_delta` solves t
 * **Adaptive Transport:** Intelligently chooses the optimal transfer strategy:
     * *Small Files (< 100KB):* Direct Zstd compression (bypasses CDC overhead, 30-80% savings).
     * *Large Files:* Full CDC pipeline with delta computation for maximum deduplication.
+    * *Interrupted Transfers:* Automatic resume from last checkpoint without re-uploading transferred bytes.
 * **Hybrid Efficiency:**
     * *Known Data:* Deduplicated via `COPY` instructions (O(1) HashMap lookup).
     * *New Data:* Compressed via `COMPRESSED_LITERAL` instructions (Zstd level 3).
@@ -160,10 +162,11 @@ Synchronize files to a remote server using automatic delta detection and compres
 
 The sync command orchestrates the entire pipeline:
 1. Connects to the server
-2. Server sends its version's signature (if file exists)
-3. Client computes delta automatically
-4. Client streams optimized patch to server
-5. Server reconstructs and verifies
+2. Server sends its version's signature (if file exists) and checks for partial uploads (`.part` files)
+3. If partial upload exists, server reports resume offset and client seeks to that position
+4. Client computes delta automatically
+5. Client streams optimized patch to server (or remaining data from resume point)
+6. Server reconstructs and verifies
 
 ```bash
 ./target/release/r_delta sync <FILE> <SERVER:PORT>
@@ -254,23 +257,24 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 
 ### Feature Status
 
-| Feature                   | Status | Description                                    |
-|:--------------------------|:------:|:-----------------------------------------------|
-| **FastCDC Engine**        |   ✅    | Gear Hash + dynamic cut-points                 |
-| **Shift Resistance**      |   ✅    | Handles insertions/deletions                   |
-| **Hybrid Compression**    |   ✅    | Zstd integration for literal runs              |
-| **Adaptive Transport**    |   ✅    | Smart strategy selection based on file size    |
-| **QUIC Configuration**    |   ✅    | Server/Client config generators                |
-| **File Sync**             |   ✅    | End-to-end network sync (`sync`)               |
-| **Directory Sync**        |   ✅    | Multi-file sync with manifest      |
-| **Manifest Generation**   |   ✅    | Fast walking with `.gitignore` + checksums     |
-| **Diff Algorithm**        |   ✅    | O(n log n) manifest comparison & sync actions  |
-| **Content Hashing**       |   ✅    | BLAKE3 checksums for reliable change detection |
-| **Sync Planning**         |   ✅    | Protocol for manifest exchange & coordination  |
-| **Parallel Transfer**     |   ✅    | futures::stream with 50-concurrent buffer      |
-| **Encryption Engine**     |   ✅    | XChaCha20-Poly1305 with Zstd compression       |
-| **Encrypted File Sync**   |   ✅    | Full file encryption & opaque server storage    |
-| **Zero-Knowledge Mode**   |   ✅    | Server cannot decrypt files (no key access)     |
+| Feature                 | Status | Description                                      |
+|:------------------------|:------:|:-------------------------------------------------|
+| **FastCDC Engine**      |   ✅    | Gear Hash + dynamic cut-points                   |
+| **Shift Resistance**    |   ✅    | Handles insertions/deletions                     |
+| **Hybrid Compression**  |   ✅    | Zstd integration for literal runs                |
+| **Adaptive Transport**  |   ✅    | Smart strategy selection based on file size      |
+| **QUIC Configuration**  |   ✅    | Server/Client config generators                  |
+| **File Sync**           |   ✅    | End-to-end network sync (`sync`)                 |
+| **Directory Sync**      |   ✅    | Multi-file sync with manifest                    |
+| **Manifest Generation** |   ✅    | Fast walking with `.gitignore` + checksums       |
+| **Diff Algorithm**      |   ✅    | O(n log n) manifest comparison & sync actions    |
+| **Content Hashing**     |   ✅    | BLAKE3 checksums for reliable change detection   |
+| **Sync Planning**       |   ✅    | Protocol for manifest exchange & coordination    |
+| **Parallel Transfer**   |   ✅    | futures::stream with 50-concurrent buffer        |
+| **Resumable Transfers** |   ✅    | Automatic resume from checkpoint on interruption |
+| **Encryption Engine**   |   ✅    | XChaCha20-Poly1305 with Zstd compression         |
+| **Encrypted File Sync** |   ✅    | Full file encryption & opaque server storage     |
+| **Zero-Knowledge Mode** |   ✅    | Server cannot decrypt files (no key access)      |
 
 ### Why r_delta is Fast
 
@@ -283,7 +287,8 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 7. **Fast Directory Walking**: The `ignore` crate (ripgrep engine) with `.gitignore` awareness for quick manifests
 8. **Smart Diff Algorithm**: O(n log n) manifest comparison to identify only changed files
 9. **Selective File Transfer**: Skips unchanged files entirely, only syncs SendFull/SendDelta actions
-10. **Parallel Transfers**: Up to 50 concurrent files saturate bandwidth and hide latency costs
+10. **Resumable Transfers**: Interrupted uploads checkpoint progress in `.part` files, resuming from last checkpoint with minimal overhead
+11. **Parallel Transfers**: Up to 50 concurrent files saturate bandwidth and hide latency costs
 
 ## 🛡️ Stability & Testing
 

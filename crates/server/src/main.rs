@@ -1,4 +1,4 @@
-use std::fs::{File, create_dir_all, rename};
+use std::fs::{File, create_dir_all, rename, OpenOptions};
 use std::io::{self, Read, Write, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -231,7 +231,7 @@ async fn handle_directory_sync(
                 }
 
                 let has_old_file = file_full_path.exists();
-                send_message(&mut file_send, &NetMessage::handshake_ack(has_old_file)).await?;
+                send_message(&mut file_send, &NetMessage::handshake_ack(has_old_file, 0)).await?;
 
                 if has_old_file {
                     let signatures = generate_signatures(&file_full_path)?;
@@ -441,7 +441,18 @@ async fn handle_file_sync(
     let file_path = storage_dir.join(&filename);
     let has_old_file = file_path.exists();
 
-    send_message(send_stream, &NetMessage::handshake_ack(has_old_file)).await?;
+    let part_path = storage_dir.join(format!("{}.part", filename));
+    let resume_offset = if part_path.exists() {
+        part_path.metadata()?.len()
+    } else {
+        0
+    };
+
+    send_message(send_stream, &NetMessage::handshake_ack(has_old_file, resume_offset)).await?;
+
+    if resume_offset > 0 {
+        info!("Found partial file for '{}': {} bytes, resuming transfer", filename, resume_offset);
+    }
 
     if has_old_file {
         info!("Base file found for '{}'. Starting delta mode", filename);
@@ -540,10 +551,15 @@ async fn handle_file_sync(
 
         let mut data_stream = connection.accept_uni().await?;
 
-        let temp_path = storage_dir.join(format!("{}.tmp", filename));
-        let mut file = BufWriter::new(File::create(&temp_path)?);
+        let temp_path = storage_dir.join(format!("{}.part", filename));
+        let mut file = if resume_offset > 0 {
+            info!("Resuming upload from {} bytes", resume_offset);
+            BufWriter::new(OpenOptions::new().create(true).append(true).open(&temp_path)?)
+        } else {
+            BufWriter::new(File::create(&temp_path)?)
+        };
         let mut buffer = vec![0u8; BUFFER_SIZE];
-        let mut total_received = 0u64;
+        let mut total_received = resume_offset;
 
         let upload_start = Instant::now();
 
@@ -676,6 +692,17 @@ async fn handle_encrypted_file_sync(
     create_dir_all(&storage_dir)?;
     let file_path = storage_dir.join(&filename);
 
+    let part_path = storage_dir.join(format!("{}.part", filename));
+    let resume_offset = if part_path.exists() {
+        part_path.metadata()?.len()
+    } else {
+        0
+    };
+
+    if resume_offset > 0 {
+        info!("Found partial encrypted file for '{}': {} bytes, resuming", filename, resume_offset);
+    }
+
     info!("Receiving encrypted file from {}...", remote_addr);
     let upload_start = Instant::now();
 
@@ -683,7 +710,7 @@ async fn handle_encrypted_file_sync(
 
     let mut encrypted_data = Vec::new();
     let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut total_received = 0u64;
+    let mut total_received = resume_offset;
 
     loop {
         match data_stream.read(&mut buffer).await {
@@ -709,11 +736,17 @@ async fn handle_encrypted_file_sync(
     }
 
     info!("Storing encrypted blob (opaque storage)...");
-    let temp_path = storage_dir.join(format!("{}.tmp", filename));
-    let mut file = File::create(&temp_path)?;
-    file.write_all(&encrypted_data)?;
-    file.flush()?;
-    drop(file);
+    let temp_path = storage_dir.join(format!("{}.part", filename));
+    
+    if resume_offset > 0 {
+        let mut file = OpenOptions::new().create(true).append(true).open(&temp_path)?;
+        file.write_all(&encrypted_data)?;
+        file.flush()?;
+    } else {
+        let mut file = File::create(&temp_path)?;
+        file.write_all(&encrypted_data)?;
+        file.flush()?;
+    }
 
     let upload_duration = upload_start.elapsed();
     let throughput_mb = (total_received as f64 / 1_000_000.0) / upload_duration.as_secs_f64().max(0.001);
