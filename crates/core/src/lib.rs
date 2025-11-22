@@ -7,6 +7,7 @@ pub mod protocol;
 pub mod network;
 pub mod manifest;
 pub mod diff;
+pub mod crypto;
 
 #[cfg(test)]
 mod chaos_tests {
