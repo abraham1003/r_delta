@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/built_with-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-v0.1.3--Alpha-yellow.svg)]()
 
-**r\_delta** is a high-performance, data transport engine that achieves **99%+ bandwidth savings** on incremental updates. It combines **Content-Defined Chunking (CDC)** for shift-resistant deduplication with **Zstd compression** and **SKIP optimization** for maximum efficiency.
+**r\_delta** is a high-performance, data transport engine that achieves **99%+ bandwidth savings** on incremental updates. It combines **Content-Defined Chunking (CDC)** for shift-resistant deduplication with **Zstd compression**.
 
 > **v0.1.3 Features**
 > - ✅ **Parallel Directory Sync**: Concurrent file transfers (up to 50 files simultaneously) via futures::stream
@@ -16,7 +16,6 @@
 > - ✅ **Hybrid Compression**: Zstd integration for optimal patch sizes
 > - ✅ **Network Sync**: Full QUIC-based client-server architecture with cryptographic verification
 > - ✅ **Professional UX**: Real-time progress bars, spinners, and deduplication reports
-> - ✅ **SKIP Optimization**: Additional 5% patch size reduction for large sequential regions
 > - ✅ **Telemetry**: Structured logging with performance metrics (throughput, duration, savings)
 > - ✅ **Forensic Verification**: Bit-level integrity checking
 > - ✅ **Content-Based Checksums**: BLAKE3 hashing for reliable file change detection
@@ -226,11 +225,10 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 | **FastCDC Engine**        |   ✅    | Gear Hash + dynamic cut-points                 |
 | **Shift Resistance**      |   ✅    | Handles insertions/deletions                   |
 | **Hybrid Compression**    |   ✅    | Zstd integration for literal runs              |
-| **SKIP Optimization**     |   ✅    | Merges consecutive COPYs (~5% gain)            |
 | **Adaptive Transport**    |   ✅    | Smart strategy selection based on file size    |
 | **QUIC Configuration**    |   ✅    | Server/Client config generators                |
 | **File Sync**             |   ✅    | End-to-end network sync (`sync`)               |
-| **Directory Sync**        |   ✅    | **Phase 3** Multi-file sync with manifest      |
+| **Directory Sync**        |   ✅    | Multi-file sync with manifest      |
 | **Manifest Generation**   |   ✅    | Fast walking with `.gitignore` + checksums     |
 | **Diff Algorithm**        |   ✅    | O(n log n) manifest comparison & sync actions  |
 | **Content Hashing**       |   ✅    | BLAKE3 checksums for reliable change detection |
@@ -243,13 +241,20 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 2. **Content-Defined Chunking**: O(1) hash lookups for chunk matching
 3. **BLAKE3 Hashing**: SIMD-optimized cryptographic hashing (4-8x faster than SHA-256)
 4. **Zstd Compression**: Industry-leading decompression speed (~10x faster than gzip)
-5. **SKIP Optimization**: Reduces metadata overhead by ~5% for sequential regions
-6. **Streaming Architecture**: Constant memory usage regardless of file size
-7. **QUIC Protocol**: Multiplexed streams with 0-RTT connection establishment
-8. **Fast Directory Walking**: The `ignore` crate (ripgrep engine) with `.gitignore` awareness for quick manifests
-9. **Smart Diff Algorithm**: O(n log n) manifest comparison to identify only changed files
-10. **Selective File Transfer**: Skips unchanged files entirely, only syncs SendFull/SendDelta actions
-11. **Parallel Transfers**: Up to 50 concurrent files saturate bandwidth and hide latency costs
+5. **Streaming Architecture**: Constant memory usage regardless of file size
+6. **QUIC Protocol**: Multiplexed streams with 0-RTT connection establishment
+7. **Fast Directory Walking**: The `ignore` crate (ripgrep engine) with `.gitignore` awareness for quick manifests
+8. **Smart Diff Algorithm**: O(n log n) manifest comparison to identify only changed files
+9. **Selective File Transfer**: Skips unchanged files entirely, only syncs SendFull/SendDelta actions
+10. **Parallel Transfers**: Up to 50 concurrent files saturate bandwidth and hide latency costs
+
+## 🛡️ Stability & Testing
+
+`r_delta` is built for correctness first.
+
+* **Chaos Test(Fuzzing):** The core engine is battle-tested using `proptest`. It has survived thousands of iterations of random file generation, mutation, and reconstruction cycles to ensure `Original == Recreated` is mathematically guaranteed.
+* **Memory Safety:** Rust's ownership model combined with a strict 8MB streaming buffer ensures the process never crashes due to OOM, even on 100GB+ files.
+* **Type Safety:** The protocol uses `bincode` with strict typing to prevent malformed packets from crashing the server.
 
 ## 📄 Licensing
 

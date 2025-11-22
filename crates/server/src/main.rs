@@ -695,13 +695,6 @@ async fn read_instruction_async(
                 compressed_data,
             })
         }
-        0x04 => {
-            let mut length_buf = [0u8; 8];
-            stream.read_exact(&mut length_buf).await
-                .map_err(|e| io::Error::new(io::ErrorKind::UnexpectedEof, e))?;
-            let length = u64::from_le_bytes(length_buf);
-            Ok(PatchInstruction::Skip(length))
-        }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Unknown patch instruction tag: {}", tag),

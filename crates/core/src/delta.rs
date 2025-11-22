@@ -14,7 +14,6 @@ pub enum PatchInstruction {
         decompressed_len: u64,
         compressed_data: Vec<u8>,
     },
-    Skip(u64),
 }
 
 impl PatchInstruction {
@@ -40,12 +39,6 @@ impl PatchInstruction {
                 bytes.extend_from_slice(&decompressed_len.to_le_bytes());
                 bytes.extend_from_slice(&(compressed_data.len() as u32).to_le_bytes());
                 bytes.extend_from_slice(compressed_data);
-                bytes
-            }
-            PatchInstruction::Skip(length) => {
-                let mut bytes = Vec::new();
-                bytes.push(0x04);
-                bytes.extend_from_slice(&length.to_le_bytes());
                 bytes
             }
         }
@@ -83,12 +76,6 @@ impl PatchInstruction {
                     decompressed_len,
                     compressed_data,
                 })
-            }
-            0x04 => {
-                let mut length_buf = [0u8; 8];
-                reader.read_exact(&mut length_buf)?;
-                let length = u64::from_le_bytes(length_buf);
-                Ok(PatchInstruction::Skip(length))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -253,7 +240,7 @@ impl DeltaGenerator {
 }
 
 fn optimize_instructions(instructions: Vec<PatchInstruction>) -> Vec<PatchInstruction> {
-    const MIN_SKIP_THRESHOLD: usize = 3;
+    const MIN_MERGE_THRESHOLD: usize = 3;
 
     let mut optimized = Vec::new();
     let mut i = 0;
@@ -277,9 +264,10 @@ fn optimize_instructions(instructions: Vec<PatchInstruction>) -> Vec<PatchInstru
                 }
             }
 
-            if consecutive_copies.len() >= MIN_SKIP_THRESHOLD {
-                let total_length: u64 = consecutive_copies.iter().map(|(_, len)| *len as u64).sum();
-                optimized.push(PatchInstruction::Skip(total_length));
+            if consecutive_copies.len() >= MIN_MERGE_THRESHOLD {
+                let first_offset = consecutive_copies[0].0;
+                let total_length: usize = consecutive_copies.iter().map(|(_, len)| *len).sum();
+                optimized.push(PatchInstruction::Copy(first_offset, total_length));
                 i = j;
             } else {
                 optimized.push(instructions[i].clone());

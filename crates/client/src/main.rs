@@ -423,10 +423,6 @@ async fn handle_differential_sync(
             r_delta_core::delta::PatchInstruction::CompressedLiteral { compressed_data, .. } => {
                 patch_size += 13 + compressed_data.len();
             },
-            r_delta_core::delta::PatchInstruction::Skip(len) => {
-                patch_size += 9;
-                bytes_matched += *len as usize;
-            },
         }
     }
 
