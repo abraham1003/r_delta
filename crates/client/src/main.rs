@@ -8,8 +8,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use console::style;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
+use r_delta_core::encryption::EncryptionManager;
+use r_delta_core::pipeline::{DataPipeline, SecurePipeline};
+use r_delta_core::crypto::KeyContext;
 
-async fn handle_sync_dir(directory: PathBuf, server: String) -> Result<(), String> {
+async fn handle_sync_dir(directory: PathBuf, server: String, encrypt: bool, key_path: Option<PathBuf>) -> Result<(), String> {
     if !directory.exists() {
         return Err(format!("Directory '{}' does not exist", directory.display()));
     }
@@ -17,9 +20,21 @@ async fn handle_sync_dir(directory: PathBuf, server: String) -> Result<(), Strin
         return Err(format!("'{}' is not a directory", directory.display()));
     }
 
+    let key_context = if encrypt {
+        println!("Initializing encryption...");
+        let key = EncryptionManager::load_or_generate(key_path)
+            .map_err(|e| format!("Failed to initialize encryption: {}", e))?;
+        Some(key)
+    } else {
+        None
+    };
+
     println!("Synchronizing directory to server...");
     println!("  Directory: '{}'", directory.display());
     println!("  Server: {}", server);
+    if encrypt {
+        println!("  Encryption: ENABLED (XChaCha20-Poly1305)");
+    }
 
     let start = Instant::now();
 
@@ -115,12 +130,14 @@ async fn handle_sync_dir(directory: PathBuf, server: String) -> Result<(), Strin
         let connection = connection.clone();
         let directory = directory.clone();
         let sync_plan_items = sync_plan.items.clone();
+        let key_context_copy = key_context.as_ref().map(|k| KeyContext::from_bytes(*k.key_bytes()));
         
         let results: Vec<Result<(), String>> = stream::iter(files_to_sync)
             .map(|file_path| {
                 let connection = connection.clone();
                 let directory = directory.clone();
                 let pb = pb.clone();
+                let key_context = key_context_copy.as_ref().map(|k| KeyContext::from_bytes(*k.key_bytes()));
                 let action = sync_plan_items.iter()
                     .find(|item| &item.path == &file_path)
                     .map(|item| item.action.clone());
@@ -132,10 +149,10 @@ async fn handle_sync_dir(directory: PathBuf, server: String) -> Result<(), Strin
                     
                     let result = match action {
                         Some(r_delta_core::diff::SyncAction::SendFull) => {
-                            sync_single_file(&full_path, &file_path, &connection, false, true).await
+                            sync_single_file(&full_path, &file_path, &connection, false, true, &key_context).await
                         }
                         Some(r_delta_core::diff::SyncAction::SendDelta) => {
-                            sync_single_file(&full_path, &file_path, &connection, true, true).await
+                            sync_single_file(&full_path, &file_path, &connection, true, true, &key_context).await
                         }
                         _ => Ok(()),
                     };
@@ -189,6 +206,7 @@ async fn sync_single_file(
     connection: &quinn::Connection,
     use_delta: bool,
     silent: bool,
+    key_context: &Option<KeyContext>,
 ) -> Result<(), String> {
     let metadata = std::fs::metadata(file_path)
         .map_err(|e| format!("Failed to read file metadata: {}", e))?;
@@ -198,31 +216,39 @@ async fn sync_single_file(
 
     if file_size < SMALL_FILE_THRESHOLD {
         if !silent { 
-            println!("  → Small file detected, using compressed upload"); 
+            if key_context.is_some() {
+                println!("  → Small file detected, using encrypted upload"); 
+            } else {
+                println!("  → Small file detected, using compressed upload"); 
+            }
         }
         
         let (mut send_stream, mut recv_stream) = connection.open_bi().await
             .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-        let compressed_msg = r_delta_core::protocol::NetMessage::SendFullCompressed {
-            filename: relative_path.to_string(),
-            original_size: file_size,
-        };
-        send_message(&mut send_stream, &compressed_msg).await?;
+        if let Some(key) = key_context {
+            handle_encrypted_upload(file_path, &relative_path, connection, &mut send_stream, &mut recv_stream, key).await?;
+            if !silent { println!("  ✓ Verified"); }
+        } else {
+            let compressed_msg = r_delta_core::protocol::NetMessage::SendFullCompressed {
+                filename: relative_path.to_string(),
+                original_size: file_size,
+            };
+            send_message(&mut send_stream, &compressed_msg).await?;
+            handle_compressed_upload(file_path, connection).await?;
 
-        handle_compressed_upload(file_path, connection).await?;
-
-        let verify_msg = receive_message(&mut recv_stream).await?;
-        match verify_msg {
-            r_delta_core::protocol::NetMessage::VerifyResult { matches, .. } => {
-                if matches {
-                    if !silent { println!("  ✓ Verified"); }
-                } else {
-                    return Err("Server verification failed".to_string());
+            let verify_msg = receive_message(&mut recv_stream).await?;
+            match verify_msg {
+                r_delta_core::protocol::NetMessage::VerifyResult { matches, .. } => {
+                    if matches {
+                        if !silent { println!("  ✓ Verified"); }
+                    } else {
+                        return Err("Server verification failed".to_string());
+                    }
                 }
-            }
-            _ => {
-                return Err("Expected verification result".to_string());
+                _ => {
+                    return Err("Expected verification result".to_string());
+                }
             }
         }
 
@@ -232,10 +258,17 @@ async fn sync_single_file(
     let (mut send_stream, mut recv_stream) = connection.open_bi().await
         .map_err(|e| format!("Failed to open stream: {}", e))?;
 
-    let handshake = r_delta_core::protocol::NetMessage::handshake(
-        relative_path.to_string(), 
-        file_size
-    );
+    let handshake = if key_context.is_some() {
+        r_delta_core::protocol::NetMessage::handshake_encrypted(
+            relative_path.to_string(), 
+            file_size
+        )
+    } else {
+        r_delta_core::protocol::NetMessage::handshake(
+            relative_path.to_string(), 
+            file_size
+        )
+    };
     send_message(&mut send_stream, &handshake).await?;
 
     let ack = receive_message(&mut recv_stream).await?;
@@ -243,16 +276,33 @@ async fn sync_single_file(
     match ack {
         r_delta_core::protocol::NetMessage::HandshakeAck { has_old_file } => {
             if has_old_file && use_delta {
-                if !silent { println!("  → Delta sync"); }
+                if !silent { 
+                    if key_context.is_some() {
+                        println!("  → Encrypted delta sync"); 
+                    } else {
+                        println!("  → Delta sync"); 
+                    }
+                }
                 handle_differential_sync(
                     file_path,
                     connection,
                     &mut send_stream,
                     &mut recv_stream,
+                    key_context,
                 ).await?;
             } else {
-                if !silent { println!("  → Full upload"); }
-                handle_full_upload(file_path, connection).await?;
+                if !silent { 
+                    if key_context.is_some() {
+                        println!("  → Encrypted full upload"); 
+                    } else {
+                        println!("  → Full upload"); 
+                    }
+                }
+                if let Some(key) = key_context {
+                    handle_encrypted_upload(file_path, &relative_path, connection, &mut send_stream, &mut recv_stream, key).await?;
+                } else {
+                    handle_full_upload(file_path, connection).await?;
+                }
             }
         }
         r_delta_core::protocol::NetMessage::Error { message } => {
@@ -280,8 +330,17 @@ async fn sync_single_file(
     Ok(())
 }
 
-async fn handle_sync(file: PathBuf, server: String) -> Result<(), String> {
+async fn handle_sync(file: PathBuf, server: String, encrypt: bool, key_path: Option<PathBuf>) -> Result<(), String> {
     validate_file_exists(&file, "File")?;
+
+    let key_context = if encrypt {
+        println!("Initializing encryption...");
+        let key = EncryptionManager::load_or_generate(key_path)
+            .map_err(|e| format!("Failed to initialize encryption: {}", e))?;
+        Some(key)
+    } else {
+        None
+    };
 
     let filename = file.file_name()
         .and_then(|n| n.to_str())
@@ -296,6 +355,9 @@ async fn handle_sync(file: PathBuf, server: String) -> Result<(), String> {
     println!("  File: '{}'", file.display());
     println!("  Size: {}", format_bytes(file_size as usize));
     println!("  Server: {}", server);
+    if encrypt {
+        println!("  Encryption: ENABLED (XChaCha20-Poly1305)");
+    }
 
     let start = Instant::now();
 
@@ -316,7 +378,11 @@ async fn handle_sync(file: PathBuf, server: String) -> Result<(), String> {
     let (mut send_stream, mut recv_stream) = connection.open_bi().await
         .map_err(|e| format!("Failed to open control stream: {}", e))?;
 
-    let handshake = r_delta_core::protocol::NetMessage::handshake(filename.clone(), file_size);
+    let handshake = if encrypt {
+        r_delta_core::protocol::NetMessage::handshake_encrypted(filename.clone(), file_size)
+    } else {
+        r_delta_core::protocol::NetMessage::handshake(filename.clone(), file_size)
+    };
     send_message(&mut send_stream, &handshake).await?;
 
     let ack = receive_message(&mut recv_stream).await?;
@@ -327,14 +393,62 @@ async fn handle_sync(file: PathBuf, server: String) -> Result<(), String> {
             println!("  Server has old version: {}", if has_old_file { "yes" } else { "no" });
 
             if has_old_file {
-                handle_differential_sync(
+                let verification_already_read = handle_differential_sync(
                     &file,
                     &connection,
                     &mut send_stream,
                     &mut recv_stream,
+                    &key_context,
                 ).await?;
+                
+                if !verification_already_read {
+                    let verify_msg = receive_message(&mut recv_stream).await?;
+                    match verify_msg {
+                        r_delta_core::protocol::NetMessage::VerifyResult { matches, checksum } => {
+                            if matches {
+                                let duration = start.elapsed();
+                                println!("\n✓ Synchronization complete!");
+                                println!("  Checksum: {}", hex::encode(checksum));
+                                println!("  Total time: {}", format_duration(duration));
+                            } else {
+                                return Err("Server verification failed".to_string());
+                            }
+                        }
+                        _ => {
+                            return Err("Expected verification result".to_string());
+                        }
+                    }
+                } else {
+                    let duration = start.elapsed();
+                    println!("\n✓ Synchronization complete!");
+                    println!("  Total time: {}", format_duration(duration));
+                }
             } else {
-                handle_full_upload(&file, &connection).await?;
+                if let Some(key) = &key_context {
+                    handle_encrypted_upload(&file, &filename, &connection, &mut send_stream, &mut recv_stream, key).await?;
+                    let duration = start.elapsed();
+                    println!("\n✓ Synchronization complete!");
+                    println!("  Total time: {}", format_duration(duration));
+                } else {
+                    handle_full_upload(&file, &connection).await?;
+                    
+                    let verify_msg = receive_message(&mut recv_stream).await?;
+                    match verify_msg {
+                        r_delta_core::protocol::NetMessage::VerifyResult { matches, checksum } => {
+                            if matches {
+                                let duration = start.elapsed();
+                                println!("\n✓ Synchronization complete!");
+                                println!("  Checksum: {}", hex::encode(checksum));
+                                println!("  Total time: {}", format_duration(duration));
+                            } else {
+                                return Err("Server verification failed".to_string());
+                            }
+                        }
+                        _ => {
+                            return Err("Expected verification result".to_string());
+                        }
+                    }
+                }
             }
         }
         r_delta_core::protocol::NetMessage::Error { message } => {
@@ -342,23 +456,6 @@ async fn handle_sync(file: PathBuf, server: String) -> Result<(), String> {
         }
         _ => {
             return Err("Unexpected response from server".to_string());
-        }
-    }
-
-    let verify_msg = receive_message(&mut recv_stream).await?;
-    match verify_msg {
-        r_delta_core::protocol::NetMessage::VerifyResult { matches, checksum } => {
-            if matches {
-                let duration = start.elapsed();
-                println!("\n✓ Synchronization complete!");
-                println!("  Checksum: {}", hex::encode(checksum));
-                println!("  Total time: {}", format_duration(duration));
-            } else {
-                return Err("Server verification failed".to_string());
-            }
-        }
-        _ => {
-            return Err("Expected verification result".to_string());
         }
     }
 
@@ -371,9 +468,15 @@ async fn handle_sync(file: PathBuf, server: String) -> Result<(), String> {
 async fn handle_differential_sync(
     file: &PathBuf,
     connection: &quinn::Connection,
-    _send_stream: &mut quinn::SendStream,
+    send_stream: &mut quinn::SendStream,
     recv_stream: &mut quinn::RecvStream,
-) -> Result<(), String> {
+    key_context: &Option<KeyContext>,
+) -> Result<bool, String> {
+    if let Some(key) = key_context {
+        handle_encrypted_differential_sync(file, connection, send_stream, recv_stream, key).await?;
+        return Ok(true);
+    }
+
     println!("\n→ Receiving signatures from server...");
 
     let request_sig = receive_message(recv_stream).await?;
@@ -480,6 +583,67 @@ async fn handle_differential_sync(
     println!("  Savings:        {}", style(format!("{:.2}%", savings)).bold().green());
     println!("  Match Rate:     {}", style(format!("{:.2}%", dedup_ratio)).cyan());
 
+    Ok(false)
+}
+
+async fn handle_encrypted_differential_sync(
+    file: &PathBuf,
+    connection: &quinn::Connection,
+    send_stream: &mut quinn::SendStream,
+    recv_stream: &mut quinn::RecvStream,
+    key: &KeyContext,
+) -> Result<(), String> {
+    println!("\n→ Encrypted differential sync: re-encrypting full file...");
+
+    let file_data = std::fs::read(file)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let file_size = file_data.len();
+
+    println!("→ Encrypting file...");
+
+    let key_copy = KeyContext::from_bytes(*key.key_bytes());
+    let pipeline = SecurePipeline::with_default_compression(key_copy);
+    let encrypted_data = pipeline.process(&file_data)
+        .map_err(|e| format!("Failed to encrypt file: {}", e))?;
+
+    println!("✓ Encrypted: {} → {}", 
+             format_bytes(file_size), 
+             format_bytes(encrypted_data.len()));
+
+    let filename = file.file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "Invalid filename".to_string())?;
+
+    let upload_msg = r_delta_core::protocol::NetMessage::SendFullEncrypted {
+        filename: filename.to_string(),
+        original_size: file_size as u64,
+        encrypted_size: encrypted_data.len() as u64,
+    };
+    send_message(send_stream, &upload_msg).await?;
+
+    println!("→ Uploading encrypted blob...");
+
+    let mut upload_stream = connection.open_uni().await
+        .map_err(|e| format!("Failed to open upload stream: {}", e))?;
+    upload_stream.write_all(&encrypted_data).await
+        .map_err(|e| format!("Failed to upload: {}", e))?;
+    upload_stream.finish()
+        .map_err(|e| format!("Failed to close upload stream: {}", e))?;
+
+    println!("✓ Upload complete");
+
+    let verify_msg = receive_message(recv_stream).await?;
+    match verify_msg {
+        r_delta_core::protocol::NetMessage::VerifyResult { matches, .. } => {
+            if !matches {
+                return Err("Server verification failed".to_string());
+            }
+        }
+        _ => {
+            return Err("Expected verification result".to_string());
+        }
+    }
+
     Ok(())
 }
 
@@ -576,6 +740,81 @@ async fn handle_compressed_upload(
              format_bytes(file_size as usize),
              format_bytes(compressed_data.len()),
              compression_ratio);
+
+    Ok(())
+}
+
+async fn handle_encrypted_upload(
+    file: &PathBuf,
+    filename: &str,
+    connection: &quinn::Connection,
+    send_stream: &mut quinn::SendStream,
+    recv_stream: &mut quinn::RecvStream,
+    key: &KeyContext,
+) -> Result<(), String> {
+    let file_size = std::fs::metadata(file)
+        .map_err(|e| format!("Failed to get file size: {}", e))?
+        .len();
+
+    println!("\n→ Encrypting file...");
+
+    let mut file_data = Vec::new();
+    let mut file_reader = File::open(file)
+        .map_err(|e| format!("Failed to open file: {}", e))?;
+    file_reader.read_to_end(&mut file_data)
+        .map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let key_context_copy = KeyContext::from_bytes(*key.key_bytes());
+    let pipeline = SecurePipeline::with_default_compression(key_context_copy);
+    let encrypted_data = pipeline.process(&file_data)
+        .map_err(|e| format!("Failed to encrypt file: {}", e))?;
+
+    println!("→ Uploading encrypted file...");
+
+    let encrypted_msg = r_delta_core::protocol::NetMessage::SendFullEncrypted {
+        filename: filename.to_string(),
+        original_size: file_size,
+        encrypted_size: encrypted_data.len() as u64,
+    };
+    send_message(send_stream, &encrypted_msg).await?;
+
+    let pb = ProgressBar::new(encrypted_data.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
+            .unwrap()
+            .progress_chars("█▓░")
+    );
+
+    let mut data_stream = connection.open_uni().await
+        .map_err(|e| format!("Failed to open data stream: {}", e))?;
+
+    data_stream.write_all(&encrypted_data).await
+        .map_err(|e| format!("Failed to write to stream: {}", e))?;
+    pb.set_position(encrypted_data.len() as u64);
+
+    data_stream.finish()
+        .map_err(|e| format!("Failed to close data stream: {}", e))?;
+
+    pb.finish_and_clear();
+    
+    let size_change = encrypted_data.len() as i64 - file_size as i64;
+    println!("✓ File encrypted and uploaded: {} → {} ({:+} bytes)", 
+             format_bytes(file_size as usize),
+             format_bytes(encrypted_data.len()),
+             size_change);
+
+    let verify_msg = receive_message(recv_stream).await?;
+    match verify_msg {
+        r_delta_core::protocol::NetMessage::VerifyResult { matches, .. } => {
+            if !matches {
+                return Err("Server verification failed".to_string());
+            }
+        }
+        _ => {
+            return Err("Expected verification result".to_string());
+        }
+    }
 
     Ok(())
 }
@@ -702,6 +941,7 @@ async fn receive_message(stream: &mut quinn::RecvStream) -> Result<r_delta_core:
 
 #[derive(Parser)]
 #[command(name = "r_delta")]
+#[command(bin_name = "r_delta")]
 #[command(author = "Abraham Thomas")]
 #[command(version = "0.1.2")]
 #[command(about = "Delta synchronization tool", long_about = None)]
@@ -719,6 +959,12 @@ enum Commands {
 
         #[arg(value_name = "SERVER", help = "Server address (IP:PORT)")]
         server: String,
+
+        #[arg(long, help = "Enable end-to-end encryption (XChaCha20-Poly1305)")]
+        encrypt: bool,
+
+        #[arg(long, value_name = "KEY_FILE", help = "Path to encryption key file (auto-generates at default location if not specified)")]
+        key: Option<PathBuf>,
     },
 
     #[command(about = "Sync directory to remote server")]
@@ -728,6 +974,12 @@ enum Commands {
 
         #[arg(value_name = "SERVER", help = "Server address (IP:PORT)")]
         server: String,
+
+        #[arg(long, help = "Enable end-to-end encryption (XChaCha20-Poly1305)")]
+        encrypt: bool,
+
+        #[arg(long, value_name = "KEY_FILE", help = "Path to encryption key file (auto-generates at default location if not specified)")]
+        key: Option<PathBuf>,
     },
 
     #[command(about = "Generate signature file from source file")]
@@ -770,6 +1022,36 @@ enum Commands {
 
         #[arg(value_name = "FILE_B", help = "Second file to compare")]
         file_b: PathBuf,
+    },
+
+    #[command(about = "Generate new encryption key")]
+    Keygen {
+        #[arg(value_name = "OUTPUT_KEY", help = "Path where to save the encryption key")]
+        output_key: PathBuf,
+    },
+
+    #[command(about = "Encrypt file using pipeline (compress + encrypt)")]
+    EncryptFile {
+        #[arg(value_name = "INPUT_FILE", help = "File to encrypt")]
+        input_file: PathBuf,
+
+        #[arg(value_name = "OUTPUT_FILE", help = "Encrypted output file path")]
+        output_file: PathBuf,
+
+        #[arg(long, value_name = "KEY_FILE", help = "Path to encryption key file (uses default if not specified)")]
+        key: Option<PathBuf>,
+    },
+
+    #[command(about = "Decrypt file using pipeline (decrypt + decompress)")]
+    DecryptFile {
+        #[arg(value_name = "INPUT_FILE", help = "Encrypted file to decrypt")]
+        input_file: PathBuf,
+
+        #[arg(value_name = "OUTPUT_FILE", help = "Decrypted output file path")]
+        output_file: PathBuf,
+
+        #[arg(long, value_name = "KEY_FILE", help = "Path to encryption key file (uses default if not specified)")]
+        key: Option<PathBuf>,
     },
 }
 
@@ -1003,20 +1285,119 @@ fn handle_verify(file_a: PathBuf, file_b: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+fn handle_keygen(output_key: PathBuf) -> Result<(), String> {
+    if output_key.exists() {
+        return Err(format!("Key file already exists: {}", output_key.display()));
+    }
+
+    println!("Generating new encryption key...");
+    println!("  Output: '{}'", output_key.display());
+
+    if let Some(parent) = output_key.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+    }
+
+    let key = KeyContext::new_random();
+    key.save_to_file(&output_key)
+        .map_err(|e| format!("Failed to save key: {}", e))?;
+
+    println!("\n✓ Encryption key generated successfully");
+    println!("  Key file: '{}'", output_key.display());
+    println!("  Key length: 32 bytes (256 bits)");
+    println!("  Algorithm: XChaCha20-Poly1305");
+
+    Ok(())
+}
+
+fn handle_encrypt_file(input_file: PathBuf, output_file: PathBuf, key_path: Option<PathBuf>) -> Result<(), String> {
+    validate_file_exists(&input_file, "Input file")?;
+    validate_output_path(&output_file)?;
+
+    println!("Encrypting file using pipeline...");
+    println!("  Input: '{}'", input_file.display());
+    println!("  Output: '{}'", output_file.display());
+
+    let key = EncryptionManager::load_or_generate(key_path)
+        .map_err(|e| format!("Failed to load encryption key: {}", e))?;
+
+    let pipeline = SecurePipeline::with_default_compression(key);
+
+    let start = Instant::now();
+
+    let input_data = std::fs::read(&input_file)
+        .map_err(|e| format!("Failed to read input file: {}", e))?;
+
+    let encrypted = pipeline.process(&input_data)
+        .map_err(|e| format!("Encryption failed: {}", e))?;
+
+    std::fs::write(&output_file, encrypted.as_ref())
+        .map_err(|e| format!("Failed to write output file: {}", e))?;
+
+    let duration = start.elapsed();
+    let original_size = input_data.len();
+    let encrypted_size = encrypted.len();
+    let overhead = encrypted_size as i64 - original_size as i64;
+
+    println!("\n✓ File encrypted successfully in {}", format_duration(duration));
+    println!("  Original size: {}", format_bytes(original_size));
+    println!("  Encrypted size: {}", format_bytes(encrypted_size));
+    println!("  Size change: {:+} bytes", overhead);
+    println!("  Processing: Compression + XChaCha20-Poly1305 encryption");
+
+    Ok(())
+}
+
+fn handle_decrypt_file(input_file: PathBuf, output_file: PathBuf, key_path: Option<PathBuf>) -> Result<(), String> {
+    validate_file_exists(&input_file, "Input file")?;
+    validate_output_path(&output_file)?;
+
+    println!("Decrypting file using pipeline...");
+    println!("  Input: '{}'", input_file.display());
+    println!("  Output: '{}'", output_file.display());
+
+    let key = EncryptionManager::load_or_generate(key_path)
+        .map_err(|e| format!("Failed to load encryption key: {}", e))?;
+
+    let pipeline = SecurePipeline::with_default_compression(key);
+
+    let start = Instant::now();
+
+    let encrypted_data = std::fs::read(&input_file)
+        .map_err(|e| format!("Failed to read input file: {}", e))?;
+
+    let decrypted = pipeline.reverse(&encrypted_data)
+        .map_err(|e| format!("Decryption failed: {}", e))?;
+
+    std::fs::write(&output_file, decrypted.as_ref())
+        .map_err(|e| format!("Failed to write output file: {}", e))?;
+
+    let duration = start.elapsed();
+    let encrypted_size = encrypted_data.len();
+    let decrypted_size = decrypted.len();
+
+    println!("\n✓ File decrypted successfully in {}", format_duration(duration));
+    println!("  Encrypted size: {}", format_bytes(encrypted_size));
+    println!("  Decrypted size: {}", format_bytes(decrypted_size));
+    println!("  Processing: XChaCha20-Poly1305 decryption + decompression");
+
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Sync { file, server } => {
+        Commands::Sync { file, server, encrypt, key } => {
             match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt.block_on(handle_sync(file, server)),
+                Ok(rt) => rt.block_on(handle_sync(file, server, encrypt, key)),
                 Err(e) => Err(format!("Failed to create async runtime: {}", e)),
             }
         }
 
-        Commands::SyncDir { directory, server } => {
+        Commands::SyncDir { directory, server, encrypt, key } => {
             match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt.block_on(handle_sync_dir(directory, server)),
+                Ok(rt) => rt.block_on(handle_sync_dir(directory, server, encrypt, key)),
                 Err(e) => Err(format!("Failed to create async runtime: {}", e)),
             }
         }
@@ -1042,6 +1423,16 @@ fn main() {
             file_a,
             file_b,
         } => handle_verify(file_a, file_b),
+
+        Commands::Keygen { output_key } => handle_keygen(output_key),
+
+        Commands::EncryptFile { input_file, output_file, key } => {
+            handle_encrypt_file(input_file, output_file, key)
+        }
+
+        Commands::DecryptFile { input_file, output_file, key } => {
+            handle_decrypt_file(input_file, output_file, key)
+        }
     };
 
     if let Err(e) = result {

@@ -9,6 +9,9 @@
 > **v0.1.3 Features**
 > - ✅ **Parallel Directory Sync**: Concurrent file transfers (up to 50 files simultaneously) via futures::stream
 > - ✅ **Adaptive Transport Strategy**: Automatically uses Zstd compression for small files (< 100KB), bypassing CDC overhead for bandwidth savings and reduced latency
+> - ✅ **End-to-End Encryption**: XChaCha20-Poly1305 authenticated encryption with client-side key management
+> - ✅ **Encrypted Full File Upload**: First sync encrypts and uploads encrypted blob (opaque server storage)
+> - ✅ **Encrypted Differential Sync**: Updates to encrypted files maintain zero-knowledge encryption
 >
 > **v0.1.2 Features** 
 > - ✅ **Directory Synchronization**: Sync entire directories with smart diff algorithm
@@ -35,6 +38,9 @@ Most delta tools solve only half the problem (deduplication). `r_delta` solves t
     * *Known Data:* Deduplicated via `COPY` instructions (O(1) HashMap lookup).
     * *New Data:* Compressed via `COMPRESSED_LITERAL` instructions (Zstd level 3).
     * *Sequential Data:* Optimized via `SKIP` instructions (~5% metadata reduction).
+* **Encryption Modes:**
+    * *Unencrypted Files:* FastCDC + Delta Sync (Ultra Fast) - Only delta transmitted, bandwidth savings on incremental changes
+    * *Encrypted Files:* Zstd + XChaCha20 (Ultra Secure) - Full file re-encrypted on updates for zero-knowledge, server never sees plaintext
 * **Memory Safe:** Streaming architecture with 8MB buffer limits prevents RAM spikes, regardless of file size.
 * **Professional UX:** Real-time progress bars, spinners, and deduplication reports show exactly what's happening.
 * **Telemetry:** Structured logging with performance metrics (throughput, duration, savings).
@@ -163,7 +169,30 @@ The sync command orchestrates the entire pipeline:
 ./target/release/r_delta sync <FILE> <SERVER:PORT>
 ```
 
-#### Directory Sync (The Swarm)
+**Encrypted File Sync:**
+
+Protect sensitive files with end-to-end encryption using the `--encrypt` flag:
+
+```bash
+# First sync - generates encryption key if missing
+./target/release/r_delta sync sensitive_file.bin 127.0.0.1:4433 --encrypt
+
+# Update - re-encrypts and uploads new encrypted blob
+./target/release/r_delta sync sensitive_file.bin 127.0.0.1:4433 --encrypt
+
+# With custom key location
+./target/release/r_delta sync sensitive_file.bin 127.0.0.1:4433 --encrypt --key /path/to/key.key
+```
+
+**Encryption Details:**
+- **Algorithm:** XChaCha20-Poly1305 (authenticated encryption)
+- **Key Generation:** Client-side only (server never has key)
+- **Storage:** Server stores opaque encrypted blobs (zero-knowledge)
+- **First Sync:** Entire file compressed and encrypted
+- **Updates:** Full file re-encrypted (maintains zero-knowledge property)
+- **Security:** 256-bit keys, 192-bit nonces, authentication tags prevent tampering
+
+#### Directory Sync
 
 Synchronize entire directory trees with intelligent manifest-based coordination and parallel execution:
 
@@ -213,6 +242,11 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 * **Compression:** Hybrid Mode.
   * *Deduplication:* HashMap lookups for known data.
   * *Compression:* Zstd (Streaming Mode) for unknown literals.
+* **Encryption:** XChaCha20-Poly1305 (when `--encrypt` flag used).
+  * *Key Management:* Client-side only, server has no decryption capability.
+  * *Pipeline:* Compress-then-Encrypt (Zstd 3 → XChaCha20 with Poly1305 MAC).
+  * *Storage:* Server stores encrypted blobs as opaque binary (zero-knowledge).
+  * *Nonce Generation:* 192-bit random per-file encryption.
 * **Transport Protocol:** QUIC (via `quinn`).
   * *Stream 1 (Bi-directional):* Control Plane (Handshakes, Signatures) via Bincode.
   * *Stream 2 (Uni-directional):* Data Plane (Patch Transfer).
@@ -234,6 +268,9 @@ The project is organized as a Cargo workspace with clear separation of concerns:
 | **Content Hashing**       |   ✅    | BLAKE3 checksums for reliable change detection |
 | **Sync Planning**         |   ✅    | Protocol for manifest exchange & coordination  |
 | **Parallel Transfer**     |   ✅    | futures::stream with 50-concurrent buffer      |
+| **Encryption Engine**     |   ✅    | XChaCha20-Poly1305 with Zstd compression       |
+| **Encrypted File Sync**   |   ✅    | Full file encryption & opaque server storage    |
+| **Zero-Knowledge Mode**   |   ✅    | Server cannot decrypt files (no key access)     |
 
 ### Why r_delta is Fast
 

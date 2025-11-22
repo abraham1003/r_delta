@@ -56,9 +56,9 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<(), Box<dyn std:
     let first_msg = receive_message(&mut recv_stream).await?;
 
     match first_msg {
-        NetMessage::Handshake { filename, file_size, protocol_version } => {
-            info!("File sync from {}: file='{}', size={} bytes, protocol=v{}",
-                  remote_addr, filename, file_size, protocol_version);
+        NetMessage::Handshake { filename, file_size, protocol_version, is_encrypted } => {
+            info!("File sync from {}: file='{}', size={} bytes, protocol=v{}, encrypted={}",
+                  remote_addr, filename, file_size, protocol_version, is_encrypted);
 
             if protocol_version != 1 {
                 warn!("Protocol version mismatch from {}: expected v1, got v{}",
@@ -72,6 +72,7 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<(), Box<dyn std:
             handle_file_sync(
                 filename,
                 file_size,
+                is_encrypted,
                 &connection,
                 &mut send_stream,
                 &mut recv_stream,
@@ -91,6 +92,19 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<(), Box<dyn std:
                 remote_addr,
             ).await?;
         }
+        NetMessage::SendFullEncrypted { filename, original_size, encrypted_size } => {
+            info!("Encrypted file upload from {}: file='{}', original_size={} bytes, encrypted_size={} bytes",
+                  remote_addr, filename, original_size, encrypted_size);
+
+            handle_compressed_file_sync(
+                filename,
+                encrypted_size,
+                &connection,
+                &mut send_stream,
+                &mut recv_stream,
+                remote_addr,
+            ).await?;
+        }
         NetMessage::ManifestRequest => {
             info!("Directory sync from {}", remote_addr);
             handle_directory_sync(
@@ -103,7 +117,7 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<(), Box<dyn std:
         _ => {
             error!("Invalid initial message from {}", remote_addr);
             send_message(&mut send_stream, &NetMessage::error(
-                "Expected Handshake, SendFullCompressed, or ManifestRequest message".to_string()
+                "Expected Handshake, SendFullCompressed, SendFullEncrypted, or ManifestRequest message".to_string()
             )).await?;
             return Err("Invalid initial message".into());
         }
@@ -202,7 +216,7 @@ async fn handle_directory_sync(
         let handshake_msg = receive_message(&mut file_recv).await?;
 
         match handshake_msg {
-            NetMessage::Handshake { filename, file_size: _, protocol_version } => {
+            NetMessage::Handshake { filename, file_size: _, protocol_version, is_encrypted: _ } => {
                 if protocol_version != 1 {
                     send_message(&mut file_send, &NetMessage::error(
                         format!("Unsupported protocol version: {}", protocol_version)
@@ -343,8 +357,40 @@ async fn handle_directory_sync(
 
                 info!("  ✓ {} synced successfully", filename);
             }
+            NetMessage::SendFullEncrypted { filename, original_size, encrypted_size } => {
+                info!("  → Receiving encrypted file: {} ({} bytes original, {} bytes encrypted)", 
+                    filename, original_size, encrypted_size);
+
+                let file_full_path = storage_dir.join(&filename);
+                
+                if let Some(parent) = file_full_path.parent() {
+                    create_dir_all(parent)?;
+                }
+
+                let mut data_stream = connection.accept_uni().await?;
+                let mut encrypted_data = Vec::new();
+                let mut buffer = vec![0u8; BUFFER_SIZE];
+
+                loop {
+                    match data_stream.read(&mut buffer).await {
+                        Ok(Some(n)) => {
+                            encrypted_data.extend_from_slice(&buffer[..n]);
+                        }
+                        Ok(None) => break,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+
+                let mut file = BufWriter::new(File::create(&file_full_path)?);
+                file.write_all(&encrypted_data)?;
+                file.flush()?;
+
+                file_send.finish()?;
+
+                info!("  ✓ {} stored as encrypted blob", filename);
+            }
             _ => {
-                error!("Expected Handshake or SendFullCompressed for file {}", file_path);
+                error!("Expected Handshake, SendFullCompressed, or SendFullEncrypted for file {}", file_path);
                 continue;
             }
         }
@@ -384,9 +430,10 @@ async fn handle_directory_sync(
 async fn handle_file_sync(
     filename: String,
     file_size: u64,
+    is_encrypted: bool,
     connection: &quinn::Connection,
     send_stream: &mut quinn::SendStream,
-    _recv_stream: &mut quinn::RecvStream,
+    recv_stream: &mut quinn::RecvStream,
     remote_addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let storage_dir = PathBuf::from("./server_storage");
@@ -398,6 +445,30 @@ async fn handle_file_sync(
 
     if has_old_file {
         info!("Base file found for '{}'. Starting delta mode", filename);
+
+        if is_encrypted {
+            info!("Encrypted file detected - expecting full re-upload");
+
+            let next_msg = receive_message(recv_stream).await?;
+            match next_msg {
+                NetMessage::SendFullEncrypted { filename: enc_filename, original_size, encrypted_size } => {
+                    info!("Received SendFullEncrypted for update: original={}, encrypted={}", original_size, encrypted_size);
+                    handle_encrypted_file_sync(
+                        enc_filename,
+                        encrypted_size,
+                        connection,
+                        send_stream,
+                        recv_stream,
+                        remote_addr,
+                    ).await?;
+                    return Ok(());
+                }
+                _ => {
+                    error!("Expected SendFullEncrypted message from {}", remote_addr);
+                    return Err("Expected SendFullEncrypted message".into());
+                }
+            }
+        }
 
         let sig_start = Instant::now();
         let signatures = generate_signatures(&file_path)?;
@@ -443,6 +514,29 @@ async fn handle_file_sync(
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     } else {
         warn!("Base file missing for '{}'. Fallback to full upload", filename);
+
+        if is_encrypted {
+            info!("Waiting for SendFullEncrypted message from {}", remote_addr);
+            let next_msg = receive_message(recv_stream).await?;
+            match next_msg {
+                NetMessage::SendFullEncrypted { filename: enc_filename, original_size, encrypted_size } => {
+                    info!("Received SendFullEncrypted: original={}, encrypted={}", original_size, encrypted_size);
+                    handle_encrypted_file_sync(
+                        enc_filename,
+                        encrypted_size,
+                        connection,
+                        send_stream,
+                        recv_stream,
+                        remote_addr,
+                    ).await?;
+                    return Ok(());
+                }
+                _ => {
+                    error!("Expected SendFullEncrypted message from {}", remote_addr);
+                    return Err("Expected SendFullEncrypted message".into());
+                }
+            }
+        }
 
         let mut data_stream = connection.accept_uni().await?;
 
@@ -567,6 +661,73 @@ async fn handle_compressed_file_sync(
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     info!("Compressed file '{}' sync from {} completed", filename, remote_addr);
+    Ok(())
+}
+
+async fn handle_encrypted_file_sync(
+    filename: String,
+    encrypted_size: u64,
+    connection: &quinn::Connection,
+    send_stream: &mut quinn::SendStream,
+    _recv_stream: &mut quinn::RecvStream,
+    remote_addr: std::net::SocketAddr,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage_dir = PathBuf::from("./server_storage");
+    create_dir_all(&storage_dir)?;
+    let file_path = storage_dir.join(&filename);
+
+    info!("Receiving encrypted file from {}...", remote_addr);
+    let upload_start = Instant::now();
+
+    let mut data_stream = connection.accept_uni().await?;
+
+    let mut encrypted_data = Vec::new();
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut total_received = 0u64;
+
+    loop {
+        match data_stream.read(&mut buffer).await {
+            Ok(Some(n)) => {
+                encrypted_data.extend_from_slice(&buffer[..n]);
+                total_received += n as u64;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                error!("Stream read error from {}: {}", remote_addr, e);
+                return Err(format!("Stream read error: {}", e).into());
+            }
+        }
+    }
+
+    if total_received != encrypted_size {
+        error!("Size mismatch from {}: expected {}, got {}",
+               remote_addr, encrypted_size, total_received);
+        return Err(format!(
+            "Size mismatch: expected {}, got {}",
+            encrypted_size, total_received
+        ).into());
+    }
+
+    info!("Storing encrypted blob (opaque storage)...");
+    let temp_path = storage_dir.join(format!("{}.tmp", filename));
+    let mut file = File::create(&temp_path)?;
+    file.write_all(&encrypted_data)?;
+    file.flush()?;
+    drop(file);
+
+    let upload_duration = upload_start.elapsed();
+    let throughput_mb = (total_received as f64 / 1_000_000.0) / upload_duration.as_secs_f64().max(0.001);
+
+    rename(&temp_path, &file_path)?;
+    info!("Encrypted file '{}' stored successfully: {} bytes (opaque blob)", filename, total_received);
+    info!("Upload complete: {:.2} MB/s, duration: {:.2}s", throughput_mb, upload_duration.as_secs_f64());
+
+    let checksum = compute_file_checksum(&file_path)?;
+    send_message(send_stream, &NetMessage::verify_result(true, checksum)).await?;
+    send_stream.finish()?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    info!("Encrypted file '{}' sync from {} completed", filename, remote_addr);
     Ok(())
 }
 
